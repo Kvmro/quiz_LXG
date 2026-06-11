@@ -1,13 +1,12 @@
 """
 结构修理 刷题助手 — 多用户版
-支持 Firebase（推荐云端部署）和本地文件两种模式
+登录/注册：Firebase Auth → Firestore
+答题：st.form 提交，避免刷新丢失登录态
 """
 import streamlit as st
 import json
 import random
 import time
-import hashlib
-import threading
 import requests
 from pathlib import Path
 
@@ -15,16 +14,8 @@ st.set_page_config(page_title="结构修理 刷题助手", page_icon="🔧", lay
 
 # ===================== 常量 =====================
 BANK_PATH = Path(__file__).resolve().parent / "quiz_bank.json"
-FIREBASE_AVAILABLE = False
 db = None
 firebase_api_key = None
-
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-    FIREBASE_AVAILABLE = True
-except ImportError:
-    pass
 
 # ===================== CSS =====================
 st.markdown("""
@@ -48,46 +39,47 @@ st.markdown("""
     [data-testid="stProgressBar"] { border-radius: 9999px; height: 12px; background: #c8e6c9; }
     [data-testid="stProgressBar"] > div { border-radius: 9999px; background: linear-gradient(90deg, #4caf50, #81c784); }
     hr { border: 0; height: 2px; background: linear-gradient(90deg, transparent, #c8e6c9, transparent); margin: 1.5rem 0; }
-    .login-card {
-        background: #fff; border-radius: 1rem; padding: 2rem;
-        box-shadow: 0 10px 25px rgba(0,0,0,0.1); max-width: 420px; margin: 4rem auto;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ===================== Firebase 初始化 =====================
 def init_firebase():
     global db, firebase_api_key
-    if not FIREBASE_AVAILABLE:
-        return False
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+    except ImportError:
+        return
+
     try:
         api_key = None
         cred = None
-        # 优先读 Streamlit Cloud secrets
+        # 1) Streamlit Cloud secrets
         try:
             api_key = st.secrets["firebase"]["api_key"]
-            sa_json = st.secrets["firebase"]["service_account"]
-            if isinstance(sa_json, str):
-                sa_json = json.loads(sa_json)
-            cred = credentials.Certificate(sa_json)
+            raw = st.secrets["firebase"]["service_account"]
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            cred = credentials.Certificate(raw)
         except Exception:
-            # 尝试本地文件
-            local_sa = Path(__file__).resolve().parent / "firebase-service-account.json"
-            local_cfg = Path(__file__).resolve().parent / "firebase_config.json"
-            if local_sa.exists() and local_cfg.exists():
-                with open(local_cfg) as f:
-                    cfg = json.load(f)
-                api_key = cfg.get("api_key")
-                cred = credentials.Certificate(str(local_sa))
+            pass
+
+        # 2) 本地文件：firebase-service-account.json + firebase_config.json
+        if cred is None:
+            sa = Path(__file__).resolve().parent / "firebase-service-account.json"
+            cfg = Path(__file__).resolve().parent / "firebase_config.json"
+            if sa.exists() and cfg.exists():
+                with open(cfg) as f:
+                    api_key = json.load(f).get("api_key")
+                cred = credentials.Certificate(str(sa))
+
         if cred and api_key:
             if not firebase_admin._apps:
                 firebase_admin.initialize_app(cred)
             db = firestore.client()
             firebase_api_key = api_key
-            return True
     except Exception:
         pass
-    return False
 
 # ===================== 题库加载 =====================
 @st.cache_data(ttl=3600, show_spinner="正在加载题库...")
@@ -121,119 +113,62 @@ def load_questions(file_path):
         })
     return normalized
 
-# ===================== Firebase Auth =====================
-def firebase_sign_in(email, password):
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={firebase_api_key}"
-    r = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
-    return r.json()
-
+# ===================== Firebase Auth REST API =====================
 def firebase_sign_up(email, password):
+    """注册：调用 Firebase Auth REST API 创建账号，成功后返回 localId + idToken"""
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={firebase_api_key}"
     r = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
     return r.json()
 
-# ===================== 进度存储（Firebase / 本地） =====================
-_save_lock = threading.Lock()
+def firebase_sign_in(email, password):
+    """登录：调用 Firebase Auth REST API 验证邮箱密码，成功后返回 localId + idToken"""
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={firebase_api_key}"
+    r = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    return r.json()
 
-def _get_progress_doc_ref(uid):
+# ===================== Firestore 进度 CRUD =====================
+def _progress_doc(uid):
     return db.collection("users").document(uid).collection("data").document("progress")
 
-def load_user_progress(uid):
-    """加载用户进度（Firebase 或本地）"""
-    if db:
-        doc = _get_progress_doc_ref(uid).get()
-        if doc.exists:
-            data = doc.to_dict()
-            st.session_state.correct_ids = set(data.get("correct_ids", []))
-            st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
-            st.session_state.error_counts = data.get("error_counts", {})
-        return
-    # 本地模式
-    local_path = Path(__file__).resolve().parent / f"progress_{uid}.json"
-    if local_path.exists():
-        with open(local_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        st.session_state.correct_ids = set(data.get("correct_ids", []))
-        st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
-        st.session_state.error_counts = data.get("error_counts", {})
+def _init_user_firestore(uid, email):
+    """注册第二步：在 Firestore 写入用户初始化文档"""
+    _progress_doc(uid).set({
+        "email": email,
+        "correct_ids": [],
+        "incorrect_ids": [],
+        "error_counts": {},
+        "created_at": int(time.time()),
+    })
 
-def save_user_progress(uid):
-    """保存用户进度（Firebase 或本地）"""
-    data = {
+def _load_from_firestore(uid):
+    """登录第二步：从 Firestore 拉取用户进度到 session_state"""
+    doc = _progress_doc(uid).get()
+    if doc.exists:
+        d = doc.to_dict()
+        st.session_state.correct_ids = set(d.get("correct_ids", []))
+        st.session_state.incorrect_ids = set(d.get("incorrect_ids", []))
+        st.session_state.error_counts = d.get("error_counts", {})
+    else:
+        # 用户首次登录，初始化空进度
+        _init_user_firestore(uid, st.session_state.user_email)
+
+def _save_to_firestore(uid):
+    """同步当前 session_state 进度到 Firestore"""
+    _progress_doc(uid).set({
         "correct_ids": list(st.session_state.correct_ids),
         "incorrect_ids": list(st.session_state.incorrect_ids),
         "error_counts": st.session_state.error_counts,
-        "timestamp": int(time.time()),
-    }
-    if db:
-        def _save():
-            with _save_lock:
-                _get_progress_doc_ref(uid).set(data, merge=True)
-        threading.Thread(target=_save, daemon=True).start()
-    else:
-        local_path = Path(__file__).resolve().parent / f"progress_{uid}.json"
-        with _save_lock:
-            with open(local_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+        "updated_at": int(time.time()),
+    }, merge=True)
 
-def clear_user_progress(uid):
-    """清空用户所有进度"""
-    if db:
-        _get_progress_doc_ref(uid).delete()
-    else:
-        local_path = Path(__file__).resolve().parent / f"progress_{uid}.json"
-        if local_path.exists():
-            local_path.unlink()
-    st.session_state.correct_ids = set()
-    st.session_state.incorrect_ids = set()
-    st.session_state.error_counts = {}
+def _clear_firestore(uid):
+    _progress_doc(uid).delete()
 
-# ===================== 本地用户管理（仅本地模式） =====================
-LOCAL_USERS_PATH = Path(__file__).resolve().parent / "local_users.json"
 
-def load_local_users():
-    if LOCAL_USERS_PATH.exists():
-        with open(LOCAL_USERS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_local_users(users_data):
-    with open(LOCAL_USERS_PATH, "w", encoding="utf-8") as f:
-        json.dump(users_data, f, ensure_ascii=False, indent=2)
-
-def hash_password(password):
-    return hashlib.sha256(f"quiz_app_salt_{password}".encode()).hexdigest()
-
-def local_register(username, password):
-    users = load_local_users()
-    if username in users:
-        return False, "用户名已存在"
-    if len(password) < 4:
-        return False, "密码至少4位"
-    users[username] = {"password_hash": hash_password(password), "created_at": int(time.time())}
-    save_local_users(users)
-    return True, "注册成功"
-
-def local_login(username, password):
-    users = load_local_users()
-    if username not in users:
-        return False, "用户不存在"
-    if users[username]["password_hash"] != hash_password(password):
-        return False, "密码错误"
-    return True, "登录成功"
 
 # ===================== 出题逻辑 =====================
 def get_mode_value(label):
     return {"全部题目": "all", "仅单选题": "single", "仅多选题": "multi", "仅判断题": "judge", "仅错题": "wrong"}[label]
-
-def reset_quiz():
-    mode = get_mode_value(st.session_state.selected_mode_label)
-    st.session_state.current_batch = []
-    st.session_state.current_question_idx = 0
-    st.session_state.submitted_answers = {}
-    st.session_state.quiz_finished = False
-    st.session_state.quiz_started = True
-    generate_batch(mode)
 
 def generate_batch(mode):
     all_qs = st.session_state.all_questions
@@ -279,77 +214,91 @@ def generate_batch(mode):
     st.session_state.quiz_finished = not batch
     st.session_state.batch_id = random.randint(1, 1000000)
 
-# ===================== 登录/注册页面 =====================
+def save_progress(uid):
+    """保存当前进度到 Firestore"""
+    _save_to_firestore(uid)
+
+# ===================== 登录/注册页 =====================
 def render_login_page():
     st.title("🔧 结构修理 刷题助手")
 
-    tab1, tab2 = st.tabs(["🔑 登录", "📝 注册"])
+    mode = st.radio("登录方式", ["登录", "注册"], horizontal=True, key="auth_mode", label_visibility="collapsed")
+    is_register = (mode == "注册")
 
-    with tab1:
-        email = st.text_input("用户名 / 邮箱", key="login_email", placeholder="请输入用户名或邮箱")
-        password = st.text_input("密码", type="password", key="login_password", placeholder="请输入密码")
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            if st.button("登 录", type="primary", use_container_width=True):
-                if not email or not password:
-                    st.error("请填写完整信息")
-                elif db:
-                    resp = firebase_sign_in(email, password)
-                    if "idToken" in resp:
-                        st.session_state.user_email = resp["email"]
-                        st.session_state.user_uid = resp["localId"]
-                        st.session_state.logged_in = True
-                        st.rerun()
-                    else:
-                        msg = resp.get("error", {}).get("message", "登录失败")
-                        st.error(f"登录失败: {msg}")
-                else:
-                    ok, msg = local_login(email, password)
-                    if ok:
-                        st.session_state.user_email = email
-                        st.session_state.user_uid = email  # 本地模式用用户名做 uid
-                        st.session_state.logged_in = True
-                        st.rerun()
-                    else:
-                        st.error(msg)
+    with st.form("auth_form", clear_on_submit=False):
+        email = st.text_input("邮箱", key="auth_email", placeholder="请输入邮箱地址")
+        password = st.text_input("密码", type="password", key="auth_password", placeholder="至少 6 位")
+        confirm = ""
+        if is_register:
+            confirm = st.text_input("确认密码", type="password", key="auth_confirm", placeholder="再次输入密码")
 
-    with tab2:
-        new_email = st.text_input("用户名 / 邮箱", key="reg_email", placeholder="请输入用户名或邮箱")
-        new_password = st.text_input("密码", type="password", key="reg_password", placeholder="至少6位（Firebase）或4位（本地）")
-        confirm_pw = st.text_input("确认密码", type="password", key="reg_confirm", placeholder="再次输入密码")
-        if st.button("注 册", type="primary", use_container_width=True):
-            if not new_email or not new_password:
-                st.error("请填写完整信息")
-            elif new_password != confirm_pw:
-                st.error("两次密码不一致")
-            elif db:
-                resp = firebase_sign_up(new_email, new_password)
-                if "idToken" in resp:
-                    st.success("✅ 注册成功！请切换到登录标签登录。")
-                else:
+        btn_label = "📝 注 册" if is_register else "🔑 登 录"
+        submitted = st.form_submit_button(btn_label, type="primary", use_container_width=True)
+
+        if submitted:
+            if not email or not password:
+                st.error("请填写邮箱和密码")
+                return
+            if "@" not in email or "." not in email.split("@")[-1]:
+                st.error("请输入有效的邮箱地址")
+                return
+
+            if is_register:
+                # ====== 注册流程：Auth 创建账号 → Firestore 初始化 ======
+                if confirm != password:
+                    st.error("两次密码不一致")
+                    return
+                if len(password) < 6:
+                    st.error("密码至少 6 位")
+                    return
+
+                resp = firebase_sign_up(email, password)
+                if "idToken" not in resp:
                     msg = resp.get("error", {}).get("message", "注册失败")
-                    st.error(f"注册失败: {msg}")
+                    if "EMAIL_EXISTS" in msg:
+                        st.error("该邮箱已被注册，请直接登录")
+                    elif "WEAK_PASSWORD" in msg:
+                        st.error("密码强度不够，请至少 6 位")
+                    else:
+                        st.error(f"注册失败: {msg}")
+                    return
+
+                uid = resp["localId"]
+                _init_user_firestore(uid, email)
+                st.session_state.user_email = email
+                st.session_state.user_uid = uid
+                st.session_state.logged_in = True
+                st.rerun()
             else:
-                ok, msg = local_register(new_email, new_password)
-                if ok:
-                    st.success(f"✅ {msg}！请切换到登录标签登录。")
-                else:
-                    st.error(msg)
+                # ====== 登录流程：Auth 验证 → Fetch Firestore ======
+                resp = firebase_sign_in(email, password)
+                if "idToken" not in resp:
+                    msg = resp.get("error", {}).get("message", "登录失败")
+                    if "EMAIL_NOT_FOUND" in msg or "INVALID_PASSWORD" in msg:
+                        st.error("邮箱或密码错误")
+                    elif "INVALID_EMAIL" in msg:
+                        st.error("邮箱格式不正确")
+                    else:
+                        st.error(f"登录失败: {msg}")
+                    return
 
-    # 底部提示
-    mode_text = "☁️ Firebase 云同步模式" if db else "💻 本地模式（数据存储在本机）"
-    st.caption(mode_text)
+                uid = resp["localId"]
+                st.session_state.user_email = resp["email"]
+                st.session_state.user_uid = uid
+                st.session_state.logged_in = True
+                _load_from_firestore(uid)
+                st.rerun()
 
-# ===================== 刷题主界面 =====================
+
+# ===================== 侧边栏 =====================
 def render_sidebar():
     uid = st.session_state.user_uid
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.user_email}**")
-        st.caption("已登录")
 
         if st.button("🚪 退出登录"):
-            for key in ["logged_in", "user_email", "user_uid", "all_questions"]:
-                st.session_state.pop(key, None)
+            for k in ["logged_in", "user_email", "user_uid"]:
+                st.session_state.pop(k, None)
             st.rerun()
 
         st.divider()
@@ -361,7 +310,6 @@ def render_sidebar():
             index=["全部题目", "仅单选题", "仅多选题", "仅判断题", "仅错题"].index(st.session_state.selected_mode_label),
             horizontal=True,
         )
-
         if selected != st.session_state.selected_mode_label:
             st.session_state.selected_mode_label = selected
             if st.session_state.quiz_started:
@@ -374,62 +322,44 @@ def render_sidebar():
         st.info(f"题库：共 **{total}** 题（单选 {single_n} · 多选 {multi_n} · 判断 {judge_n}）")
 
         if st.button("🚀 开始/重置练习", type="primary"):
-            reset_quiz()
+            mode = get_mode_value(st.session_state.selected_mode_label)
+            st.session_state.current_batch = []
+            st.session_state.current_question_idx = 0
+            st.session_state.submitted_answers = {}
+            st.session_state.quiz_finished = False
+            st.session_state.quiz_started = True
+            generate_batch(mode)
 
         if st.session_state.quiz_started:
             st.divider()
             st.header("📊 学习进度")
-
             correct_n = len(st.session_state.correct_ids)
             incorrect_n = len(st.session_state.incorrect_ids)
             answered_n = correct_n + incorrect_n
             accuracy = (correct_n / answered_n * 100) if answered_n > 0 else 0
             mastery_pct = (correct_n / total * 100) if total > 0 else 0
-
             st.progress(mastery_pct / 100, text=f"✅ 已掌握: {mastery_pct:.1f}%")
             st.markdown(f"<div style='text-align:center;color:#6b7280;font-size:0.9rem;'>{correct_n} / {total} 题</div>", unsafe_allow_html=True)
-
             c1, c2 = st.columns(2)
-            with c1:
-                st.metric("❌ 未掌握", incorrect_n)
-            with c2:
-                st.metric("🎯 正确率", f"{accuracy:.1f}%")
-
-            with st.expander("📋 详细统计", expanded=False):
-                st.write(f"**总题量:** {total} 题")
-                st.write(f"**已答题量:** {answered_n} 题")
-                st.write(f"**剩余题量:** {total - answered_n} 题")
+            c1.metric("❌ 未掌握", incorrect_n)
+            c2.metric("🎯 正确率", f"{accuracy:.1f}%")
 
         st.divider()
         st.header("💾 数据管理")
         with st.expander("⚠️ 高级选项", expanded=False):
-            st.warning("⚠️ 将永久删除您的所有学习进度！")
-            if st.button("✅ 确认清空", type="primary", key="confirm_clear"):
-                clear_user_progress(uid)
+            st.warning("⚠️ 将永久删除此账号的所有学习进度！")
+            if st.button("✅ 确认清空", type="primary"):
+                _clear_firestore(uid)
+                st.session_state.correct_ids = set()
+                st.session_state.incorrect_ids = set()
+                st.session_state.error_counts = {}
                 st.success("✅ 已清空！")
                 st.rerun()
 
-        st.divider()
-        st.header("📝 错题库")
-        wrong_review = [
-            q for q in st.session_state.all_questions
-            if q["id"] in st.session_state.error_counts and st.session_state.error_counts[q["id"]] >= 2
-        ]
-        st.metric("需重点复习", len(wrong_review))
-        with st.expander("点击展开错题库", expanded=False):
-            if not wrong_review:
-                st.info("暂无需要重点复习的错题。")
-            else:
-                for q in wrong_review:
-                    ec = st.session_state.error_counts[q["id"]]
-                    with st.expander(f"ID: {q['id']} (错 {ec} 次)"):
-                        st.write(f"**题干:** {q['question']}")
-                        cl = q["answer"].split("|")
-                        co = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
-                        st.markdown(f"**正确答案:** <span style='color:green'>{', '.join(co)}</span>", unsafe_allow_html=True)
-
+# ===================== 答题主界面（st.form 版） =====================
 def render_main():
     uid = st.session_state.user_uid
+
     if not st.session_state.quiz_started:
         st.info("请在左侧选择模式，点击「开始/重置练习」按钮开始。")
         return
@@ -438,7 +368,13 @@ def render_main():
         st.balloons()
         st.success("🎉 本轮练习完成！")
         if st.button("再来一轮", type="primary"):
-            reset_quiz()
+            mode = get_mode_value(st.session_state.selected_mode_label)
+            st.session_state.current_batch = []
+            st.session_state.current_question_idx = 0
+            st.session_state.submitted_answers = {}
+            st.session_state.quiz_finished = False
+            st.session_state.quiz_started = True
+            generate_batch(mode)
             st.rerun()
         return
 
@@ -455,10 +391,8 @@ def render_main():
 
     type_labels = {"single": "🔘 单选题", "multi": "☑️ 多选题", "judge": "⚖️ 判断题"}
     c1, c2 = st.columns([3, 1])
-    with c1:
-        st.subheader(f"第 {idx+1}/{len(batch)} 题")
-    with c2:
-        st.markdown(f"<div style='text-align:right;padding:0.3rem 0.8rem;background:#f1f5f9;border-radius:9999px;font-weight:600;font-size:0.8rem;color:#3b82f6;margin-top:0.5rem;'>{type_labels.get(qtype, '📋 题目')}</div>", unsafe_allow_html=True)
+    c1.subheader(f"第 {idx+1}/{len(batch)} 题")
+    c2.markdown(f"<div style='text-align:right;padding:0.3rem 0.8rem;background:#f1f5f9;border-radius:9999px;font-weight:600;font-size:0.8rem;color:#3b82f6;margin-top:0.5rem;'>{type_labels.get(qtype, '📋 题目')}</div>", unsafe_allow_html=True)
 
     batch_id = st.session_state.get("batch_id", 0)
     random.seed(f"{batch_id}_{qid}")
@@ -466,27 +400,57 @@ def render_main():
 
     st.markdown(f"<div style='background:#f8fafc;padding:1rem;border-radius:0.5rem;margin:0.5rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.1);'><div style='font-size:1.1rem;font-weight:600;line-height:1.5;'>{q['question']}</div></div>", unsafe_allow_html=True)
 
+    # ---------- 未提交：显示答题表单 ----------
     if not is_submitted:
-        if qtype == "multi":
-            selected = []
-            cols = st.columns(2 if len(shuffled) >= 4 else 1)
-            for i, opt in enumerate(shuffled):
-                with cols[i % len(cols)]:
-                    if st.checkbox(opt, key=f"q_{qid}_opt_{i}", value=False):
-                        selected.append(opt)
-            if st.button("✅ 提交答案", type="primary"):
-                if not selected:
-                    st.warning("⚠️ 请至少选择一个选项")
-                else:
+        with st.form("answer_form", clear_on_submit=True):
+            if qtype == "multi":
+                selected = []
+                cols = st.columns(2 if len(shuffled) >= 4 else 1)
+                for i, opt in enumerate(shuffled):
+                    with cols[i % len(cols)]:
+                        if st.checkbox(opt, key=f"q_{qid}_opt_{i}"):
+                            selected.append(opt)
+            else:
+                # 单选题 + 判断题
+                selection = st.radio("请选择", shuffled, key=f"q_{qid}", index=None, label_visibility="collapsed")
+
+            submitted = st.form_submit_button("✅ 提交答案", type="primary", use_container_width=True)
+
+            if submitted:
+                if qtype == "multi":
+                    if not selected:
+                        st.warning("⚠️ 请至少选择一个选项")
+                        return
                     st.session_state.submitted_answers[qid] = selected
-                    save_user_progress(uid)
-                    st.rerun()
-        else:
-            sel = st.radio("请选择", shuffled, key=f"q_{qid}", index=None, label_visibility="collapsed")
-            if sel is not None:
-                st.session_state.submitted_answers[qid] = sel
-                save_user_progress(uid)
-                st.rerun()
+                else:
+                    if selection is None:
+                        st.warning("⚠️ 请选择一个选项")
+                        return
+                    st.session_state.submitted_answers[qid] = selection
+
+                # 判题 + 存进度
+                user_ans = st.session_state.submitted_answers[qid]
+                correct_letters = set(q["answer"].split("|"))
+                if qtype == "multi":
+                    user_letters = {a.split(".")[0].strip().upper() for a in user_ans}
+                    correct = user_letters == correct_letters
+                else:
+                    user_letter = user_ans.split(".")[0].strip().upper()
+                    correct = user_letter in correct_letters
+
+                if correct:
+                    st.session_state.correct_ids.add(qid)
+                    st.session_state.incorrect_ids.discard(qid)
+                    st.session_state.error_counts.pop(qid, None)
+                else:
+                    st.session_state.incorrect_ids.add(qid)
+                    st.session_state.correct_ids.discard(qid)
+                    st.session_state.error_counts[qid] = st.session_state.error_counts.get(qid, 0) + 1
+
+                save_progress(uid)
+                st.rerun()  # 刷新显示结果
+
+    # ---------- 已提交：显示结果 ----------
     else:
         st.divider()
         user_ans = st.session_state.submitted_answers[qid]
@@ -501,16 +465,8 @@ def render_main():
 
         if is_correct:
             st.markdown("<div style='background:#d1fae5;padding:0.4rem 1rem;border-radius:9999px;text-align:center;border:1px solid #10b981;margin:0.3rem 0;'><span style='color:#065f46;font-weight:600;'>🎉 回答正确！</span></div>", unsafe_allow_html=True)
-            st.session_state.correct_ids.add(qid)
-            st.session_state.incorrect_ids.discard(qid)
-            st.session_state.error_counts.pop(qid, None)
         else:
             st.markdown("<div style='background:#fee2e2;padding:0.4rem 1rem;border-radius:9999px;text-align:center;border:1px solid #ef4444;margin:0.3rem 0;'><span style='color:#991b1b;font-weight:600;'>❌ 回答错误</span></div>", unsafe_allow_html=True)
-            st.session_state.incorrect_ids.add(qid)
-            st.session_state.correct_ids.discard(qid)
-            st.session_state.error_counts[qid] = st.session_state.error_counts.get(qid, 0) + 1
-
-        save_user_progress(uid)
 
         st.markdown("<h4 style='margin-top:0.75rem;'>📋 所有选项：</h4>", unsafe_allow_html=True)
         for opt in shuffled:
@@ -524,10 +480,7 @@ def render_main():
             st.markdown(f"<div style='{bg}{border}{color}padding:0.5rem;margin-bottom:0.3rem;border-radius:0.375rem;font-size:1rem;'>{fb}{opt}</div>", unsafe_allow_html=True)
 
         correct_opts = [o for o in q["options"] if any(o.startswith(c) for c in correct_letters)]
-        st.markdown("<div style='margin-top:0.75rem;padding:0.75rem;background:#f9fafb;border-radius:0.5rem;'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='margin:0 0 0.3rem;color:#374151;'>💡 正确答案：</h4>", unsafe_allow_html=True)
-        st.markdown(f"<p style='font-size:1rem;color:#065f46;margin:0;padding:0.5rem;background:#d1fae5;border-radius:0.375rem;border-left:4px solid #10b981;'><strong>{', '.join(correct_opts)}</strong></p>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("<div style='margin-top:0.75rem;padding:0.75rem;background:#f9fafb;border-radius:0.5rem;'><h4 style='margin:0 0 0.3rem;color:#374151;'>💡 正确答案：</h4><p style='font-size:1rem;color:#065f46;margin:0;padding:0.5rem;background:#d1fae5;border-radius:0.375rem;border-left:4px solid #10b981;'><strong>" + ', '.join(correct_opts) + "</strong></p></div>", unsafe_allow_html=True)
 
         if st.button("➡️ 下一题", type="primary", use_container_width=True):
             st.session_state.current_question_idx += 1
@@ -535,28 +488,21 @@ def render_main():
 
 # ===================== 主程序 =====================
 def main():
-    global db, firebase_api_key
     init_firebase()
 
-    # --- 未登录：显示登录页 ---
     if not st.session_state.get("logged_in"):
-        # 加载题库（登录页也需要统计信息）
         if "all_questions" not in st.session_state:
             st.session_state.all_questions = load_questions(BANK_PATH)
         render_login_page()
         return
 
-    # --- 已登录：初始化用户进度 ---
-    uid = st.session_state.user_uid
     if "selected_mode_label" not in st.session_state:
         st.session_state.selected_mode_label = "全部题目"
         st.session_state.quiz_started = False
         st.session_state.error_counts = {}
         st.session_state.correct_ids = set()
         st.session_state.incorrect_ids = set()
-        load_user_progress(uid)
 
-    # 题库每次都在（login 时已加载）
     if "all_questions" not in st.session_state:
         st.session_state.all_questions = load_questions(BANK_PATH)
 
