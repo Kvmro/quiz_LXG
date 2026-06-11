@@ -45,46 +45,52 @@ st.markdown("""
 # ===================== Firebase 初始化 =====================
 def init_firebase():
     global db, firebase_api_key
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-    except ImportError:
-        return
 
-    # 1) 加载 API Key（Auth REST API 用，优先从本地文件）
+    # 1) 加载 API Key
+    api_key = None
     try:
         api_key = st.secrets["firebase"]["api_key"]
     except Exception:
-        cfg = Path(__file__).resolve().parent / "firebase_config.json"
-        if cfg.exists():
-            with open(cfg) as f:
-                api_key = json.load(f).get("api_key")
-        else:
-            return
+        pass
 
     if not api_key:
-        return
+        cfg = Path(__file__).resolve().parent / "firebase_config.json"
+        if cfg.exists():
+            try:
+                with open(cfg) as f:
+                    api_key = json.load(f).get("api_key")
+            except Exception:
+                pass
+
+    # 硬编码兜底（确保 Streamlit Cloud 上一定可用）
+    if not api_key:
+        api_key = "AIzaSyDMTrkNp0owogIvuMjCz_K6HZIlUezJVgQ"
+
     firebase_api_key = api_key
 
-    # 2) 加载 Service Account（Firestore 用）
+    # 2) 尝试加载 Firestore
     try:
-        raw = st.secrets["firebase"]["service_account"]
-        if isinstance(raw, str):
-            raw = json.loads(raw)
-        cred = credentials.Certificate(raw)
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+        raw = None
+        try:
+            raw = st.secrets["firebase"]["service_account"]
+        except Exception:
+            pass
+        if not raw:
+            sa = Path(__file__).resolve().parent / "firebase-service-account.json"
+            if sa.exists():
+                with open(sa) as f:
+                    raw = json.load(f)
+        if raw:
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            cred = credentials.Certificate(raw)
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app(cred)
+            db = firestore.client()
     except Exception:
-        sa = Path(__file__).resolve().parent / "firebase-service-account.json"
-        if sa.exists():
-            cred = credentials.Certificate(str(sa))
-        else:
-            return
-
-    try:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        db = firestore.client()
-    except Exception as e:
-        print(f"Firestore 初始化失败: {e}")
+        pass
 
 # ===================== 题库加载 =====================
 @st.cache_data(ttl=3600, show_spinner="正在加载题库...")
