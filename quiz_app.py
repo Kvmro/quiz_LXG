@@ -46,44 +46,33 @@ def _auth_post(endpoint, data):
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={API_KEY}"
     return requests.post(url, json={**data, "returnSecureToken": True}, timeout=10).json()
 
-def _refresh_token():
-    """用 refreshToken 换新 idToken"""
-    rt = st.session_state.get("_refresh_token")
-    if not rt:
-        return None
-    url = f"https://securetoken.googleapis.com/v1/token?key={API_KEY}"
-    r = requests.post(url, data={"grant_type": "refresh_token", "refresh_token": rt}, timeout=10).json()
-    token = r.get("access_token") or r.get("id_token")
-    if token:
-        st.session_state._id_token = token
-        st.session_state._token_time = time.time()
-        if r.get("refresh_token"):
-            st.session_state._refresh_token = r["refresh_token"]
-    return token
-
 def _get_id_token():
-    """获取有效的 idToken，过期则刷新"""
-    tok = st.session_state.get("_id_token")
-    t = st.session_state.get("_token_time", 0)
-    if tok and time.time() - t < 3000:
-        return tok
-    return _refresh_token()
+    """直接用登录时的 idToken（有效期 1 小时，够用了）"""
+    return st.session_state.get("_id_token")
 
-# ===================== RTDB 操作（用用户的 idToken，零服务账号） =====================
+# ===================== RTDB 操作 =====================
 def _rtdb_get(uid):
     token = _get_id_token()
     if not token:
         return None
     url = f"{RTDB_URL}/users/{uid}.json?auth={token}"
     r = requests.get(url, timeout=10)
-    return r.json() if r.status_code == 200 else None
+    if r.status_code == 200:
+        return r.json()
+    st.session_state.fs_status = f"⚠️ 读取失败 ({r.status_code})"
+    return None
 
 def _rtdb_put(uid, data):
     token = _get_id_token()
     if not token:
+        st.session_state.fs_status = "⚠️ 未登录"
         return
     url = f"{RTDB_URL}/users/{uid}.json?auth={token}"
-    requests.put(url, json=data, timeout=10)
+    r = requests.put(url, json=data, timeout=10)
+    if r.status_code == 200:
+        st.session_state.fs_status = "☁️ 已保存"
+    else:
+        st.session_state.fs_status = f"⚠️ 保存失败 {r.status_code}: {r.text[:60]}"
 
 def load_data(uid):
     data = _rtdb_get(uid)
@@ -218,8 +207,6 @@ def _login_success(resp):
     st.session_state.user_uid = resp["localId"]
     st.session_state.logged_in = True
     st.session_state._id_token = resp["idToken"]
-    st.session_state._refresh_token = resp.get("refreshToken", "")
-    st.session_state._token_time = time.time()
 
 # ===================== 侧边栏 =====================
 def render_sidebar():
@@ -227,9 +214,10 @@ def render_sidebar():
     total = len(st.session_state.all_questions)
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.user_email}**")
+        st.caption(st.session_state.get("fs_status", ""))
 
         if st.button("🚪 退出登录"):
-            for k in ["logged_in", "user_email", "user_uid", "_id_token", "_refresh_token", "_token_time"]:
+            for k in ["logged_in", "user_email", "user_uid", "_id_token"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
