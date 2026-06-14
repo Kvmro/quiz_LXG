@@ -91,18 +91,23 @@ def _doc(uid):
     return db.collection("users").document(uid)
 
 def load_data(uid):
-    if db is None:
-        return
-    d = _doc(uid).get()
-    if d.exists:
-        data = d.to_dict()
-        st.session_state.correct_ids = set(data.get("correct_ids", []))
-        st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
-        st.session_state.error_counts = data.get("error_counts", {})
-        st.session_state.selected_mode_label = data.get("selected_mode_label", "全部题目")
+    if db is not None:
+        d = _doc(uid).get()
+        if d.exists:
+            data = d.to_dict()
+            st.session_state.correct_ids = set(data.get("correct_ids", []))
+            st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
+            st.session_state.error_counts = data.get("error_counts", {})
+            st.session_state.selected_mode_label = data.get("selected_mode_label", "全部题目")
+        else:
+            _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "selected_mode_label": "全部题目", "created_at": int(time.time())})
+            st.session_state.selected_mode_label = "全部题目"
     else:
-        _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "selected_mode_label": "全部题目", "created_at": int(time.time())})
-        st.session_state.selected_mode_label = "全部题目"
+        if "correct_ids" not in st.session_state:
+            st.session_state.correct_ids = set()
+            st.session_state.incorrect_ids = set()
+            st.session_state.error_counts = {}
+            st.session_state.selected_mode_label = "全部题目"
     st.session_state.quiz_started = False
     st.session_state.data_loaded = True
 
@@ -483,11 +488,14 @@ def main():
 
     if "selected_mode_label" not in st.session_state:
         st.session_state.selected_mode_label = "全部题目"
-    if not st.session_state.get("data_loaded"):
-        st.session_state.quiz_started = False
-        st.session_state.error_counts = {}
+    if "correct_ids" not in st.session_state:
         st.session_state.correct_ids = set()
+    if "incorrect_ids" not in st.session_state:
         st.session_state.incorrect_ids = set()
+    if "error_counts" not in st.session_state:
+        st.session_state.error_counts = {}
+    if "quiz_started" not in st.session_state:
+        st.session_state.quiz_started = False
 
     st.title("🔧 结构修理 刷题助手")
     st.divider()
