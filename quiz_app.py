@@ -85,14 +85,20 @@ def _get_sa():
     if sa is None:
         return None
     if isinstance(sa, str):
+        # 尝试 Base64 解码
         try:
-            sa = json.loads(sa)
-        except json.JSONDecodeError:
-            import re
-            sa = json.loads(re.sub(
-                r'("private_key":\s*")(.*?)(")',
-                lambda m: m.group(1)+m.group(2).replace('\n','\\n')+m.group(3),
-                sa, flags=re.DOTALL))
+            import base64
+            sa = json.loads(base64.b64decode(sa).decode())
+        except Exception:
+            # 尝试直接 JSON 解析
+            try:
+                sa = json.loads(sa)
+            except json.JSONDecodeError:
+                import re
+                sa = json.loads(re.sub(
+                    r'("private_key":\s*")(.*?)(")',
+                    lambda m: m.group(1)+m.group(2).replace('\n','\\n')+m.group(3),
+                    sa, flags=re.DOTALL))
     if isinstance(sa, dict) and "private_key" in sa:
         pk = sa["private_key"]
         if "\\n" in pk:
