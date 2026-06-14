@@ -107,12 +107,14 @@ def _get_sa():
         st.session_state.fs_status = f"⚠️ SA 格式异常（类型={raw_type}）"
         return None
 
-    # 修复私钥中的 \n 字面量 → 真换行
+    # 修复私钥中的 \n 字面量 → 真换行（无条件，安全）
     pk = sa["private_key"]
-    # 检测：如果私钥里有 \n 字面量（两个字符反斜杠+n）但没有真换行，则替换
-    if "\\n" in pk and "\n" not in pk.replace("-----", ""):
-        sa = dict(sa)
-        sa["private_key"] = pk.replace("\\n", "\n")
+    pk = pk.replace("\\n", "\n")
+    # 清理可能存在的多余转义
+    if "\\" in pk:
+        pk = pk.replace("\\\\", "\\")
+    sa = dict(sa)
+    sa["private_key"] = pk
 
     # 最终验证 + 调试
     pk = sa["private_key"]
