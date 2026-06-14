@@ -14,7 +14,7 @@ st.set_page_config(page_title="结构修理 刷题助手", page_icon="🔧", lay
 BANK_PATH = Path(__file__).resolve().parent / "quiz_bank.json"
 PROJECT_ID = "lxgdeshu"
 API_KEY = "AIzaSyDMTrkNp0owogIvuMjCz_K6HZIlUezJVgQ"
-RTDB_URL = f"https://{PROJECT_ID}.firebaseio.com"
+RTDB_URL = f"https://{PROJECT_ID}-default-rtdb.firebaseio.com"
 
 # ===================== CSS =====================
 st.markdown("""
