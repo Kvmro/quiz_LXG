@@ -86,7 +86,7 @@ def _get_sa():
             import re
             fixed = re.sub(r'("private_key":\s*")(.*?)(")', lambda m: m.group(1)+m.group(2).replace('\n','\\n')+m.group(3), sa, flags=re.DOTALL)
             sa = json.loads(fixed)
-    return sa
+    return sa if isinstance(sa, dict) and "private_key" in sa else None
 
 def _get_access_token():
     global _access_token, _token_expiry
@@ -97,83 +97,66 @@ def _get_access_token():
     if sa is None:
         return None
 
-    # 用 service account 签名 JWT → 换 access token
     import jwt
     now = int(time.time())
-    scope = "https://www.googleapis.com/auth/datastore"
-    payload = {
-        "iss": sa["client_email"],
-        "scope": scope,
-        "aud": sa["token_uri"],
-        "exp": now + 3600,
-        "iat": now,
-    }
+    payload = {"iss":sa["client_email"],"scope":"https://www.googleapis.com/auth/datastore","aud":sa["token_uri"],"exp":now+3600,"iat":now}
     signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
-    r = requests.post(sa["token_uri"], data={
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": signed,
-    }, timeout=10)
+    r = requests.post(sa["token_uri"], data={"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":signed}, timeout=10)
     resp = r.json()
     _access_token = resp.get("access_token")
     _token_expiry = now + 3600
     return _access_token
 
-def _fs_get(uid):
+def _fs_req(method, uid, data=None):
     token = _get_access_token()
     if not token:
         return None
-    url = f"{FIRESTORE_BASE}/users/{uid}?key={_get_api_key()}"
-    return requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10).json()
-
-def _fs_set(uid, data):
-    token = _get_access_token()
-    if not token:
-        return
     url = f"{FIRESTORE_BASE}/users/{uid}"
-    firestore_data = {"fields": {}}
+    headers = {"Authorization": f"Bearer {token}"}
+    if method == "GET":
+        r = requests.get(url, headers=headers, timeout=10)
+    elif method == "PATCH":
+        r = requests.patch(url, json={"fields": _to_firestore(data)}, headers=headers, timeout=10)
+    elif method == "DELETE":
+        r = requests.delete(url, headers=headers, timeout=10)
+    else:
+        return None
+    return r.json() if r.status_code in (200, 204) else None
+
+def _to_firestore(data):
+    fd = {}
     for k, v in data.items():
         if isinstance(v, list):
-            if k in ("correct_ids", "incorrect_ids"):
-                firestore_data["fields"][k] = {"arrayValue": {"values": [{"stringValue": x} for x in v]}}
-            else:
-                firestore_data["fields"][k] = {"arrayValue": {"values": [{"stringValue": x} for x in v]}}
+            fd[k] = {"arrayValue": {"values": [{"stringValue": str(x)} for x in v]}}
         elif isinstance(v, dict):
-            firestore_data["fields"][k] = {"mapValue": {"fields": {kk: {"integerValue": str(vv)} if isinstance(vv, int) else {"stringValue": str(vv)} for kk, vv in v.items()}}}
+            fd[k] = {"mapValue": {"fields": {kk: {"integerValue": str(vv)} if isinstance(vv,int) else {"stringValue":str(vv)} for kk,vv in v.items()}}}
         elif isinstance(v, int):
-            firestore_data["fields"][k] = {"integerValue": str(v)}
+            fd[k] = {"integerValue": str(v)}
         else:
-            firestore_data["fields"][k] = {"stringValue": str(v)}
-    r = requests.patch(url, json=firestore_data, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-
-def _fs_delete(uid):
-    token = _get_access_token()
-    if not token:
-        return
-    url = f"{FIRESTORE_BASE}/users/{uid}"
-    requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+            fd[k] = {"stringValue": str(v)}
+    return fd
 
 def load_data(uid):
-    doc = _fs_get(uid)
+    doc = _fs_req("GET", uid)
     if doc and "fields" in doc:
         f = doc["fields"]
         def _arr(key):
-            vals = f.get(key, {}).get("arrayValue", {}).get("values", [])
-            return [v.get("stringValue", "") for v in vals]
+            vals = f.get(key,{}).get("arrayValue",{}).get("values",[])
+            return [v.get("stringValue","") for v in vals]
         st.session_state.correct_ids = set(_arr("correct_ids"))
         st.session_state.incorrect_ids = set(_arr("incorrect_ids"))
-        ec_raw = f.get("error_counts", {}).get("mapValue", {}).get("fields", {})
-        st.session_state.error_counts = {k: int(v.get("integerValue", "0")) for k, v in ec_raw.items()}
-        st.session_state.selected_mode_label = f.get("selected_mode_label", {}).get("stringValue", "全部题目")
+        ec_raw = f.get("error_counts",{}).get("mapValue",{}).get("fields",{})
+        st.session_state.error_counts = {k: int(v.get("integerValue","0")) for k,v in ec_raw.items()}
+        st.session_state.selected_mode_label = f.get("selected_mode_label",{}).get("stringValue","全部题目")
     else:
         if "correct_ids" not in st.session_state:
             st.session_state.correct_ids = set()
             st.session_state.incorrect_ids = set()
             st.session_state.error_counts = {}
             st.session_state.selected_mode_label = "全部题目"
-        _fs_set(uid, {"email": st.session_state.user_email, "selected_mode_label": "全部题目", "created_at": int(time.time())})
 
 def save_data(uid):
-    _fs_set(uid, {
+    _fs_req("PATCH", uid, {
         "correct_ids": list(st.session_state.correct_ids),
         "incorrect_ids": list(st.session_state.incorrect_ids),
         "error_counts": st.session_state.error_counts,
@@ -182,7 +165,7 @@ def save_data(uid):
     })
 
 def clear_data(uid):
-    _fs_delete(uid)
+    _fs_req("DELETE", uid)
 
 # ===================== 题库 =====================
 @st.cache_data(ttl=3600, show_spinner="正在启动...")
@@ -288,7 +271,7 @@ def render_login():
                 st.session_state.user_email = email
                 st.session_state.user_uid = uid
                 st.session_state.logged_in = True
-                _fs_set(uid, {"email": email, "created_at": int(time.time())})
+                _fs_req("PATCH", uid, {"email": email, "created_at": int(time.time())})
                 st.rerun()
             else:
                 resp = firebase_call("signInWithPassword", email, pw)
