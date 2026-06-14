@@ -79,6 +79,14 @@ def _get_sa():
     sa = _load_secret("service_account")
     if sa is None:
         return None
+    # SA 可能是 dict（TOML 原生）或 JSON 字符串
+    if isinstance(sa, dict) and "private_key" in sa:
+        # TOML """ 不转义 \n，需手动修复私钥中的字面 \n → 真换行
+        pk = sa.get("private_key", "")
+        if "\\n" in pk and "\n" not in pk.strip("-----"):
+            sa = dict(sa)
+            sa["private_key"] = pk.replace("\\n", "\n")
+        return sa
     if isinstance(sa, str):
         try:
             sa = json.loads(sa)
