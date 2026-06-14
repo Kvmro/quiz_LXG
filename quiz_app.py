@@ -75,102 +75,68 @@ def firebase_call(endpoint, email, password):
     return r.json()
 
 # ===================== Firestore REST API =====================
+_creds = None
+
 def _get_sa():
+    global _creds
+    if _creds is not None:
+        return _creds
     sa = _load_secret("service_account")
     if sa is None:
-        st.session_state.fs_status = "⚠️ secrets 中无 service_account"
         return None
-
-    # 记录原始类型到 sidebar 方便调试
-    raw_type = type(sa).__name__
-
-    # 如果是字符串，尝试解析 JSON
     if isinstance(sa, str):
         try:
             sa = json.loads(sa)
         except json.JSONDecodeError:
-            # TOML """ 把 \n 变成真换行 → 破坏了 JSON → 尝试修复
             import re
-            fixed = re.sub(
+            sa = json.loads(re.sub(
                 r'("private_key":\s*")(.*?)(")',
-                lambda m: m.group(1) + m.group(2).replace('\n', '\\n') + m.group(3),
-                sa, flags=re.DOTALL
-            )
-            try:
-                sa = json.loads(fixed)
-            except json.JSONDecodeError:
-                st.session_state.fs_status = f"⚠️ SA JSON 解析失败（类型={raw_type}）"
-                return None
-
-    # 现在 sa 必须是 dict
-    if not isinstance(sa, dict) or "private_key" not in sa:
-        st.session_state.fs_status = f"⚠️ SA 格式异常（类型={raw_type}）"
-        return None
-
-    # 修复私钥中的 \n 字面量 → 真换行（无条件，安全）
-    pk = sa["private_key"]
-    pk = pk.replace("\\n", "\n")
-    # 清理可能存在的多余转义
-    if "\\" in pk:
-        pk = pk.replace("\\\\", "\\")
-    sa = dict(sa)
-    sa["private_key"] = pk
-
-    # 最终验证 + 调试
-    pk = sa["private_key"]
-    debug_pk = pk[:80].replace("\n","↵")
-    if "-----BEGIN PRIVATE KEY-----" not in pk:
-        st.session_state.fs_status = f"⚠️ 私钥异常: {debug_pk}"
-        return None
-
-    return sa
+                lambda m: m.group(1)+m.group(2).replace('\n','\\n')+m.group(3),
+                sa, flags=re.DOTALL))
+    if isinstance(sa, dict) and "private_key" in sa:
+        pk = sa["private_key"]
+        if "\\n" in pk:
+            sa = dict(sa)
+            sa["private_key"] = pk.replace("\\n", "\n")
+        try:
+            from google.oauth2 import service_account
+            _creds = service_account.Credentials.from_service_account_info(
+                sa, scopes=["https://www.googleapis.com/auth/datastore"])
+            return _creds
+        except Exception as e:
+            st.session_state.fs_status = f"⚠️ Credentials 创建失败: {str(e)[:40]}"
+            return None
+    st.session_state.fs_status = "⚠️ SA 格式错误"
+    return None
 
 def _get_access_token():
     global _access_token, _token_expiry
     if _access_token and time.time() < _token_expiry - 60:
         return _access_token
-
-    sa = _get_sa()
-    if sa is None:
-        st.session_state.fs_status = "⚠️ 未读取到 service_account（检查 Secrets）"
+    creds = _get_sa()
+    if creds is None:
         return None
-
     try:
-        import jwt
-    except ImportError:
-        st.session_state.fs_status = "⚠️ 缺少 PyJWT 库（检查 requirements.txt）"
-        return None
-
-    try:
-        now = int(time.time())
-        payload = {"iss":sa["client_email"],"scope":"https://www.googleapis.com/auth/datastore","aud":sa["token_uri"],"exp":now+3600,"iat":now}
-        signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
-        r = requests.post(sa["token_uri"], data={"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":signed}, timeout=10)
-        resp = r.json()
-        _access_token = resp.get("access_token")
-        _token_expiry = now + 3600
-        if not _access_token:
-            st.session_state.fs_status = f"⚠️ Token 交换失败: {resp.get('error','未知')} ({resp.get('error_description','')[:30]})"
-            return None
+        from google.auth.transport.requests import Request
+        creds.refresh(Request())
+        _access_token = creds.token
+        _token_expiry = time.time() + 3500
+        st.session_state.fs_status = "☁️ 已连接"
         return _access_token
     except Exception as e:
-        st.session_state.fs_status = f"⚠️ 签名失败: {str(e)[:40]}"
+        st.session_state.fs_status = f"⚠️ Auth 失败: {str(e)[:40]}"
         return None
 
 def _fs_req(method, uid, data=None):
     token = _get_access_token()
     if not token:
-        return None  # _get_access_token 已经设了 fs_status
+        return None
     url = f"{FIRESTORE_BASE}/users/{uid}"
     headers = {"Authorization": f"Bearer {token}"}
 
     if method == "GET":
         r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            st.session_state.fs_status = "☁️ 已连接"
-            return r.json()
-        st.session_state.fs_status = f"⚠️ 读取失败 ({r.status_code})"
-        return None
+        return r.json() if r.status_code == 200 else None
 
     if method == "DELETE":
         requests.delete(url, headers=headers, timeout=10)
