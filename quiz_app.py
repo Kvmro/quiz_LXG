@@ -227,16 +227,17 @@ def render_sidebar():
         # 侧边栏统计
         cn = len(st.session_state.correct_ids)
         in_ = len(st.session_state.incorrect_ids)
-        ans = st.session_state.get("total_answers", cn + in_)
-        total_ans = max(ans, cn + in_)
-        acc = (cn / total_ans * 100) if total_ans > 0 else 0
-        if total_ans > 0:
+        total_ans_sidebar = max(st.session_state.get("total_answers", 0), cn + in_)
+        mp = (cn / total * 100) if total > 0 else 0
+        acc = (cn / total_ans_sidebar * 100) if total_ans_sidebar > 0 else 0
+        if total_ans_sidebar > 0 or st.session_state.get("quiz_started"):
             st.divider()
-            st.header("📊 统计")
+            st.header("📊 学习进度")
+            st.progress(mp / 100, text=f"✅ 已掌握: {mp:.1f}%")
+            st.markdown(f"<div style='text-align:center;color:#6b7280;font-size:.85rem;margin-bottom:.5rem'>{cn} / {total} 题</div>", unsafe_allow_html=True)
             c1, c2 = st.columns(2)
-            c1.metric("✅ 已掌握", cn)
-            c2.metric("❌ 未掌握", in_)
-            st.metric("🎯 正确率", f"{acc:.1f}%")
+            c1.metric("❌ 未掌握", in_)
+            c2.metric("🎯 正确率", f"{acc:.1f}%")
 
         st.divider()
         if st.button("📝 查看错题", type="primary", use_container_width=True):
