@@ -1,6 +1,6 @@
 """
 结构修理 刷题助手
-Firebase Auth 登录 + Firestore 云存储
+Firebase Auth + Firestore REST API（零重依赖，冷启动秒开）
 """
 import streamlit as st
 import json
@@ -12,7 +12,12 @@ from pathlib import Path
 st.set_page_config(page_title="结构修理 刷题助手", page_icon="🔧", layout="centered")
 
 BANK_PATH = Path(__file__).resolve().parent / "quiz_bank.json"
-db = None
+PROJECT_ID = "lxgdeshu"
+FIRESTORE_BASE = f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}/databases/(default)/documents"
+
+_api_key = None
+_access_token = None
+_token_expiry = 0
 
 # ===================== CSS =====================
 st.markdown("""
@@ -36,13 +41,10 @@ st.markdown("""
     [data-testid="stProgressBar"] { border-radius: 9999px; height: 12px; background: #c8e6c9; }
     [data-testid="stProgressBar"] > div { border-radius: 9999px; background: linear-gradient(90deg, #4caf50, #81c784); }
     hr { border: 0; height: 2px; background: linear-gradient(90deg, transparent, #c8e6c9, transparent); margin: 1.5rem 0; }
-    .stat-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem; }
-    .stat-label { color: #374151; font-size: 0.85rem; }
-    .stat-value { color: #2e7d32; font-weight: 700; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ===================== Firebase =====================
+# ===================== 密钥加载 =====================
 def _load_secret(key):
     try:
         return st.secrets["firebase"][key]
@@ -60,87 +62,130 @@ def _load_secret(key):
                 return json.load(f)
     return None
 
-def init_firestore():
-    global db
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-        sa = _load_secret("service_account")
-        if sa is None:
-            return
-
-        # SA 可能是：dict / JSON 字符串 / TOML 被破坏的字符串
-        if isinstance(sa, str):
-            try:
-                sa = json.loads(sa)
-            except json.JSONDecodeError:
-                # TOML 的 """ 把 \n 转成真换行符 → 破坏了 JSON
-                # 尝试修复：把真换行替换回 \n
-                import re
-                fixed = re.sub(
-                    r'("private_key":\s*")(.*?)(")',
-                    lambda m: m.group(1) + m.group(2).replace('\n', '\\n') + m.group(3),
-                    sa, flags=re.DOTALL
-                )
-                sa = json.loads(fixed)
-
-        if not isinstance(sa, dict):
-            st.sidebar.caption("⚠️ service_account 格式错误")
-            return
-
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(credentials.Certificate(sa))
-        db = firestore.client()
-    except Exception as e:
-        st.sidebar.caption(f"⚠️ 初始化失败: {str(e)[:50]}")
+# ===================== Auth REST API =====================
+def _get_api_key():
+    global _api_key
+    if _api_key is None:
+        _api_key = _load_secret("api_key") or ""
+    return _api_key
 
 def firebase_call(endpoint, email, password):
-    key = _load_secret("api_key")
-    if key is None:
-        st.error("Firebase 未配置，请在 Streamlit Cloud → Settings → Secrets 中添加。")
-        st.stop()
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={key}"
-    r = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={_get_api_key()}"
+    r = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True}, timeout=10)
     return r.json()
 
-# ===================== Firestore CRUD =====================
-def _doc(uid):
-    return db.collection("users").document(uid)
+# ===================== Firestore REST API =====================
+def _get_sa():
+    sa = _load_secret("service_account")
+    if sa is None:
+        return None
+    if isinstance(sa, str):
+        try:
+            sa = json.loads(sa)
+        except json.JSONDecodeError:
+            import re
+            fixed = re.sub(r'("private_key":\s*")(.*?)(")', lambda m: m.group(1)+m.group(2).replace('\n','\\n')+m.group(3), sa, flags=re.DOTALL)
+            sa = json.loads(fixed)
+    return sa
+
+def _get_access_token():
+    global _access_token, _token_expiry
+    if _access_token and time.time() < _token_expiry - 60:
+        return _access_token
+
+    sa = _get_sa()
+    if sa is None:
+        return None
+
+    # 用 service account 签名 JWT → 换 access token
+    import jwt
+    now = int(time.time())
+    scope = "https://www.googleapis.com/auth/datastore"
+    payload = {
+        "iss": sa["client_email"],
+        "scope": scope,
+        "aud": sa["token_uri"],
+        "exp": now + 3600,
+        "iat": now,
+    }
+    signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
+    r = requests.post(sa["token_uri"], data={
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": signed,
+    }, timeout=10)
+    resp = r.json()
+    _access_token = resp.get("access_token")
+    _token_expiry = now + 3600
+    return _access_token
+
+def _fs_get(uid):
+    token = _get_access_token()
+    if not token:
+        return None
+    url = f"{FIRESTORE_BASE}/users/{uid}?key={_get_api_key()}"
+    return requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10).json()
+
+def _fs_set(uid, data):
+    token = _get_access_token()
+    if not token:
+        return
+    url = f"{FIRESTORE_BASE}/users/{uid}"
+    firestore_data = {"fields": {}}
+    for k, v in data.items():
+        if isinstance(v, list):
+            if k in ("correct_ids", "incorrect_ids"):
+                firestore_data["fields"][k] = {"arrayValue": {"values": [{"stringValue": x} for x in v]}}
+            else:
+                firestore_data["fields"][k] = {"arrayValue": {"values": [{"stringValue": x} for x in v]}}
+        elif isinstance(v, dict):
+            firestore_data["fields"][k] = {"mapValue": {"fields": {kk: {"integerValue": str(vv)} if isinstance(vv, int) else {"stringValue": str(vv)} for kk, vv in v.items()}}}
+        elif isinstance(v, int):
+            firestore_data["fields"][k] = {"integerValue": str(v)}
+        else:
+            firestore_data["fields"][k] = {"stringValue": str(v)}
+    r = requests.patch(url, json=firestore_data, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+
+def _fs_delete(uid):
+    token = _get_access_token()
+    if not token:
+        return
+    url = f"{FIRESTORE_BASE}/users/{uid}"
+    requests.delete(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
 
 def load_data(uid):
-    if db is not None:
-        d = _doc(uid).get()
-        if d.exists:
-            data = d.to_dict()
-            st.session_state.correct_ids = set(data.get("correct_ids", []))
-            st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
-            st.session_state.error_counts = data.get("error_counts", {})
-            st.session_state.selected_mode_label = data.get("selected_mode_label", "全部题目")
-            return
-        _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "selected_mode_label": "全部题目", "created_at": int(time.time())})
-
-    if "correct_ids" not in st.session_state:
-        st.session_state.correct_ids = set()
-        st.session_state.incorrect_ids = set()
-        st.session_state.error_counts = {}
-        st.session_state.selected_mode_label = "全部题目"
+    doc = _fs_get(uid)
+    if doc and "fields" in doc:
+        f = doc["fields"]
+        def _arr(key):
+            vals = f.get(key, {}).get("arrayValue", {}).get("values", [])
+            return [v.get("stringValue", "") for v in vals]
+        st.session_state.correct_ids = set(_arr("correct_ids"))
+        st.session_state.incorrect_ids = set(_arr("incorrect_ids"))
+        ec_raw = f.get("error_counts", {}).get("mapValue", {}).get("fields", {})
+        st.session_state.error_counts = {k: int(v.get("integerValue", "0")) for k, v in ec_raw.items()}
+        st.session_state.selected_mode_label = f.get("selected_mode_label", {}).get("stringValue", "全部题目")
+    else:
+        if "correct_ids" not in st.session_state:
+            st.session_state.correct_ids = set()
+            st.session_state.incorrect_ids = set()
+            st.session_state.error_counts = {}
+            st.session_state.selected_mode_label = "全部题目"
+        _fs_set(uid, {"email": st.session_state.user_email, "selected_mode_label": "全部题目", "created_at": int(time.time())})
 
 def save_data(uid):
-    if db is not None:
-        _doc(uid).set({
-            "correct_ids": list(st.session_state.correct_ids),
-            "incorrect_ids": list(st.session_state.incorrect_ids),
-            "error_counts": st.session_state.error_counts,
-            "selected_mode_label": st.session_state.selected_mode_label,
-            "updated_at": int(time.time()),
-        }, merge=True)
+    _fs_set(uid, {
+        "correct_ids": list(st.session_state.correct_ids),
+        "incorrect_ids": list(st.session_state.incorrect_ids),
+        "error_counts": st.session_state.error_counts,
+        "selected_mode_label": st.session_state.selected_mode_label,
+        "updated_at": int(time.time()),
+    })
 
 def clear_data(uid):
-    if db is not None:
-        _doc(uid).delete()
+    _fs_delete(uid)
 
 # ===================== 题库 =====================
-@st.cache_data(ttl=3600, show_spinner="正在加载题库...")
+@st.cache_data(ttl=3600, show_spinner="正在启动...")
 def load_questions(fp):
     if not fp.exists():
         st.error("题库文件未找到")
@@ -243,8 +288,7 @@ def render_login():
                 st.session_state.user_email = email
                 st.session_state.user_uid = uid
                 st.session_state.logged_in = True
-                if db is not None:
-                    _doc(uid).set({"email": email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "created_at": int(time.time())})
+                _fs_set(uid, {"email": email, "created_at": int(time.time())})
                 st.rerun()
             else:
                 resp = firebase_call("signInWithPassword", email, pw)
@@ -265,11 +309,6 @@ def render_sidebar():
     total = len(st.session_state.all_questions)
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.user_email}**")
-        # Firebase 状态
-        if db is not None:
-            st.caption("☁️ 云同步已连接")
-        else:
-            st.caption("⚠️ 数据仅本会话有效")
 
         if st.button("🚪 退出登录"):
             for k in ["logged_in", "user_email", "user_uid"]:
@@ -285,7 +324,6 @@ def render_sidebar():
         if sel != st.session_state.selected_mode_label:
             st.session_state.selected_mode_label = sel
 
-        # 题库统计（无白框）
         sn = sum(1 for q in st.session_state.all_questions if q["type"] == "single")
         mn = sum(1 for q in st.session_state.all_questions if q["type"] == "multi")
         jn = sum(1 for q in st.session_state.all_questions if q["type"] == "judge")
@@ -330,14 +368,10 @@ def render_sidebar():
 
 # ===================== 错题查看 =====================
 def render_wrong_questions():
-    uid = st.session_state.user_uid
     st.subheader("📝 错题回顾")
-
     wr = sorted(
         [q for q in st.session_state.all_questions if q["id"] in st.session_state.error_counts],
-        key=lambda q: st.session_state.error_counts[q["id"]],
-        reverse=True
-    )
+        key=lambda q: st.session_state.error_counts[q["id"]], reverse=True)
 
     if st.button("🔙 返回刷题", type="primary"):
         st.session_state.show_wrong = False
@@ -480,8 +514,6 @@ def render_quiz():
 
 # ===================== 主程序 =====================
 def main():
-    init_firestore()
-
     if not st.session_state.get("logged_in"):
         if "all_questions" not in st.session_state:
             st.session_state.all_questions = load_questions(BANK_PATH)
