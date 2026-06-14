@@ -95,21 +95,30 @@ def _get_access_token():
 
     sa = _get_sa()
     if sa is None:
+        st.session_state.fs_status = "⚠️ 未读取到 service_account（检查 Secrets）"
         return None
 
     try:
         import jwt
     except ImportError:
+        st.session_state.fs_status = "⚠️ 缺少 PyJWT 库（检查 requirements.txt）"
         return None
 
-    now = int(time.time())
-    payload = {"iss":sa["client_email"],"scope":"https://www.googleapis.com/auth/datastore","aud":sa["token_uri"],"exp":now+3600,"iat":now}
-    signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
-    r = requests.post(sa["token_uri"], data={"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":signed}, timeout=10)
-    resp = r.json()
-    _access_token = resp.get("access_token")
-    _token_expiry = now + 3600
-    return _access_token
+    try:
+        now = int(time.time())
+        payload = {"iss":sa["client_email"],"scope":"https://www.googleapis.com/auth/datastore","aud":sa["token_uri"],"exp":now+3600,"iat":now}
+        signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
+        r = requests.post(sa["token_uri"], data={"grant_type":"urn:ietf:params:oauth:grant-type:jwt-bearer","assertion":signed}, timeout=10)
+        resp = r.json()
+        _access_token = resp.get("access_token")
+        _token_expiry = now + 3600
+        if not _access_token:
+            st.session_state.fs_status = f"⚠️ Token 交换失败: {resp.get('error','未知')}"
+            return None
+        return _access_token
+    except Exception as e:
+        st.session_state.fs_status = f"⚠️ 签名失败: {str(e)[:40]}"
+        return None
 
 def _fs_req(method, uid, data=None):
     token = _get_access_token()
