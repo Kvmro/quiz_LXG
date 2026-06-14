@@ -324,7 +324,9 @@ def render_quiz():
     if idx >= len(batch):
         make_batch(MODE_MAP[st.session_state.selected_mode_label]); st.rerun()
     q = batch[idx]
-    qid, qtype, done = q["id"], q["type"], qid in st.session_state.batch_answers
+    qid = q["id"]
+    qtype = q["type"]
+    done = qid in st.session_state.batch_answers
     c1, c2 = st.columns([3, 1])
     c1.subheader(f"第 {idx+1}/{len(batch)} 题")
     c2.markdown(f"<div style='text-align:right;padding:0.3rem 0.8rem;background:#f1f5f9;border-radius:9999px;font-weight:600;font-size:0.8rem;color:#3b82f6;margin-top:0.5rem;'>{TYPE_LABEL.get(qtype, '📋 题目')}</div>", unsafe_allow_html=True)
