@@ -1,6 +1,6 @@
 """
 结构修理 刷题助手
-支持 Firebase Auth 登录 + Firestore 数据存储
+Firebase Auth 登录 + Firestore 云存储
 """
 import streamlit as st
 import json
@@ -11,9 +11,7 @@ from pathlib import Path
 
 st.set_page_config(page_title="结构修理 刷题助手", page_icon="🔧", layout="centered")
 
-# ===================== 常量 =====================
 BANK_PATH = Path(__file__).resolve().parent / "quiz_bank.json"
-
 db = None
 
 # ===================== CSS =====================
@@ -38,17 +36,18 @@ st.markdown("""
     [data-testid="stProgressBar"] { border-radius: 9999px; height: 12px; background: #c8e6c9; }
     [data-testid="stProgressBar"] > div { border-radius: 9999px; background: linear-gradient(90deg, #4caf50, #81c784); }
     hr { border: 0; height: 2px; background: linear-gradient(90deg, transparent, #c8e6c9, transparent); margin: 1.5rem 0; }
+    .stat-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem; }
+    .stat-label { color: #374151; font-size: 0.85rem; }
+    .stat-value { color: #2e7d32; font-weight: 700; font-size: 0.85rem; }
 </style>
 """, unsafe_allow_html=True)
 
-# ===================== Firebase 初始化 =====================
+# ===================== Firebase =====================
 def _load_secret(key):
-    """从 st.secrets 读取，失败则本地文件兜底"""
     try:
         return st.secrets["firebase"][key]
     except Exception:
         pass
-    # 本地文件兜底：firebase_config.json（api_key）/ firebase-service-account.json（service_account）
     if key == "api_key":
         cfg = Path(__file__).resolve().parent / "firebase_config.json"
         if cfg.exists():
@@ -80,13 +79,13 @@ def init_firestore():
 def firebase_call(endpoint, email, password):
     key = _load_secret("api_key")
     if key is None:
-        st.error("Firebase API Key 未配置，请在 Streamlit Cloud → Settings → Secrets 中添加。")
+        st.error("Firebase 未配置，请在 Streamlit Cloud → Settings → Secrets 中添加。")
         st.stop()
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={key}"
     r = requests.post(url, json={"email": email, "password": password, "returnSecureToken": True})
     return r.json()
 
-# ===================== Firestore 操作 =====================
+# ===================== Firestore CRUD =====================
 def _doc(uid):
     return db.collection("users").document(uid)
 
@@ -99,34 +98,30 @@ def load_data(uid):
             st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
             st.session_state.error_counts = data.get("error_counts", {})
             st.session_state.selected_mode_label = data.get("selected_mode_label", "全部题目")
-        else:
-            _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "selected_mode_label": "全部题目", "created_at": int(time.time())})
-            st.session_state.selected_mode_label = "全部题目"
-    else:
-        if "correct_ids" not in st.session_state:
-            st.session_state.correct_ids = set()
-            st.session_state.incorrect_ids = set()
-            st.session_state.error_counts = {}
-            st.session_state.selected_mode_label = "全部题目"
-    st.session_state.quiz_started = False
-    st.session_state.data_loaded = True
+            return
+        _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "selected_mode_label": "全部题目", "created_at": int(time.time())})
+
+    if "correct_ids" not in st.session_state:
+        st.session_state.correct_ids = set()
+        st.session_state.incorrect_ids = set()
+        st.session_state.error_counts = {}
+        st.session_state.selected_mode_label = "全部题目"
 
 def save_data(uid):
-    if db is None:
-        return
-    _doc(uid).set({
-        "correct_ids": list(st.session_state.correct_ids),
-        "incorrect_ids": list(st.session_state.incorrect_ids),
-        "error_counts": st.session_state.error_counts,
-        "selected_mode_label": st.session_state.selected_mode_label,
-        "updated_at": int(time.time()),
-    }, merge=True)
+    if db is not None:
+        _doc(uid).set({
+            "correct_ids": list(st.session_state.correct_ids),
+            "incorrect_ids": list(st.session_state.incorrect_ids),
+            "error_counts": st.session_state.error_counts,
+            "selected_mode_label": st.session_state.selected_mode_label,
+            "updated_at": int(time.time()),
+        }, merge=True)
 
 def clear_data(uid):
-    if db:
+    if db is not None:
         _doc(uid).delete()
 
-# ===================== 题库加载 =====================
+# ===================== 题库 =====================
 @st.cache_data(ttl=3600, show_spinner="正在加载题库...")
 def load_questions(fp):
     if not fp.exists():
@@ -153,6 +148,7 @@ def load_questions(fp):
 
 # ===================== 出题 =====================
 MODE_MAP = {"全部题目": "all", "仅单选题": "single", "仅多选题": "multi", "仅判断题": "judge", "仅错题": "wrong"}
+TYPE_LABEL = {"single": "🔘 单选题", "multi": "☑️ 多选题", "judge": "⚖️ 判断题"}
 
 def make_batch(mode):
     all_qs = st.session_state.all_questions
@@ -187,14 +183,13 @@ def make_batch(mode):
 
     st.session_state.current_batch = batch
     st.session_state.current_idx = 0
-    st.session_state.this_batch_answers = {}
+    st.session_state.batch_answers = {}
     st.session_state.quiz_finished = False
     st.session_state.batch_id = random.randint(1, 1000000)
 
-# ===================== 页面：登录/注册 =====================
+# ===================== 登录/注册 =====================
 def render_login():
     st.title("🔧 结构修理 刷题助手")
-
     mode = st.radio("登录方式", ["登录", "注册"], horizontal=True, key="auth_mode", label_visibility="collapsed")
     is_reg = (mode == "注册")
 
@@ -224,28 +219,20 @@ def render_login():
                 resp = firebase_call("signUp", email, pw)
                 if "idToken" not in resp:
                     msg = resp.get("error", {}).get("message", "")
-                    if "EMAIL_EXISTS" in msg:
-                        st.error("该邮箱已被注册，请直接登录")
-                    else:
-                        st.error(f"注册失败: {msg}")
+                    st.error("该邮箱已被注册，请直接登录" if "EMAIL_EXISTS" in msg else f"注册失败: {msg}")
                     return
-                # 注册成功 → 写入 Firestore → 自动登录
                 uid = resp["localId"]
                 st.session_state.user_email = email
                 st.session_state.user_uid = uid
                 st.session_state.logged_in = True
-                st.session_state.data_loaded = True
-                if db:
+                if db is not None:
                     _doc(uid).set({"email": email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "created_at": int(time.time())})
                 st.rerun()
             else:
                 resp = firebase_call("signInWithPassword", email, pw)
                 if "idToken" not in resp:
                     msg = resp.get("error", {}).get("message", "")
-                    if "EMAIL_NOT_FOUND" in msg or "INVALID_PASSWORD" in msg:
-                        st.error("邮箱或密码错误")
-                    else:
-                        st.error(f"登录失败: {msg}")
+                    st.error("邮箱或密码错误" if "EMAIL_NOT_FOUND" in msg or "INVALID_PASSWORD" in msg else f"登录失败: {msg}")
                     return
                 uid = resp["localId"]
                 st.session_state.user_email = resp["email"]
@@ -257,10 +244,17 @@ def render_login():
 # ===================== 侧边栏 =====================
 def render_sidebar():
     uid = st.session_state.user_uid
+    total = len(st.session_state.all_questions)
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.user_email}**")
+        # Firebase 状态
+        if db is not None:
+            st.caption("☁️ 云同步已连接")
+        else:
+            st.caption("⚠️ 数据仅本会话有效")
+
         if st.button("🚪 退出登录"):
-            for k in ["logged_in", "user_email", "user_uid", "data_loaded"]:
+            for k in ["logged_in", "user_email", "user_uid"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -273,21 +267,19 @@ def render_sidebar():
         if sel != st.session_state.selected_mode_label:
             st.session_state.selected_mode_label = sel
 
-        total = len(st.session_state.all_questions)
+        # 题库统计（无白框）
         sn = sum(1 for q in st.session_state.all_questions if q["type"] == "single")
         mn = sum(1 for q in st.session_state.all_questions if q["type"] == "multi")
         jn = sum(1 for q in st.session_state.all_questions if q["type"] == "judge")
-        st.info(f"题库：共 **{total}** 题（单选 {sn} · 多选 {mn} · 判断 {jn}）")
+        st.markdown(f"<div style='color:#2e7d32;font-size:0.85rem;font-weight:600;'>📚 题库共 {total} 题</div><div style='color:#6b7280;font-size:0.78rem;margin-bottom:0.5rem;'>单选 {sn} · 多选 {mn} · 判断 {jn}</div>", unsafe_allow_html=True)
 
         if st.button("🚀 开始/重置练习", type="primary"):
-            st.session_state.current_batch = []
-            st.session_state.current_idx = 0
-            st.session_state.this_batch_answers = {}
+            st.session_state.batch_answers = {}
             st.session_state.quiz_finished = False
             st.session_state.quiz_started = True
             make_batch(MODE_MAP[st.session_state.selected_mode_label])
 
-        if st.session_state.quiz_started:
+        if st.session_state.get("quiz_started") and st.session_state.get("current_batch"):
             st.divider()
             st.header("📊 学习进度")
             cn = len(st.session_state.correct_ids)
@@ -313,60 +305,55 @@ def render_sidebar():
                 st.session_state.correct_ids = set()
                 st.session_state.incorrect_ids = set()
                 st.session_state.error_counts = {}
+                st.session_state.quiz_started = False
                 st.success("✅ 已清空！")
                 st.rerun()
 
-# ===================== 错题查看界面 =====================
+# ===================== 错题查看 =====================
 def render_wrong_questions():
+    uid = st.session_state.user_uid
     st.subheader("📝 错题回顾")
 
-    wr = [q for q in st.session_state.all_questions
-          if q["id"] in st.session_state.error_counts and st.session_state.error_counts[q["id"]] >= 1]
+    wr = sorted(
+        [q for q in st.session_state.all_questions if q["id"] in st.session_state.error_counts],
+        key=lambda q: st.session_state.error_counts[q["id"]],
+        reverse=True
+    )
 
     if st.button("🔙 返回刷题", type="primary"):
         st.session_state.show_wrong = False
         st.rerun()
 
     if not wr:
-        st.info("🎉 暂无错题，继续保持！")
+        st.markdown("<div style='text-align:center;padding:2rem;color:#2e7d32;font-size:1.1rem;'>🎉 暂无错题，继续保持！</div>", unsafe_allow_html=True)
         return
 
-    st.markdown(f"共 **{len(wr)}** 道错题")
+    st.markdown(f"<div style='color:#2e7d32;font-weight:600;margin-bottom:0.5rem;'>📋 共 {len(wr)} 道错题（按错误次数降序）</div>", unsafe_allow_html=True)
 
     for q in wr:
         ec = st.session_state.error_counts[q["id"]]
-        qtype = q["type"]
-        type_label = TYPE_LABEL.get(qtype, "题目")
+        tlb = TYPE_LABEL.get(q["type"], "题目")
+        cl = set(q["answer"].split("|"))
+        correct_opts = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
 
-        cl = q["answer"].split("|")
-        co = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
-
-        st.markdown(f"<div style='background:#f8fafc;padding:1rem;border-radius:0.5rem;margin:0.75rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.1);'>", unsafe_allow_html=True)
-        st.markdown(f"<span style='color:#dc2626;font-weight:700;'>错 {ec} 次</span> &nbsp; {type_label} &nbsp; <span style='font-size:1rem;font-weight:600;'>{q['question']}</span>", unsafe_allow_html=True)
-        for opt in q["options"]:
-            letter = opt.split(".")[0].strip().upper()
-            if letter in cl:
-                st.markdown(f"<div style='background:#d1fae5;border:2px solid #10b981;color:#065f46;padding:0.4rem 0.75rem;margin:0.2rem 0;border-radius:0.375rem;'>✅ {opt}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='background:#f8fafc;padding:0.8rem 1rem;border-radius:0.5rem;margin:0.6rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.06);border-left:4px solid #ef4444;'>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#ef4444;font-weight:700;'>✘ {ec} 次</span> &nbsp; <span style='font-size:0.75rem;color:#6b7280;'>{tlb}</span><br><span style='font-size:1rem;font-weight:600;color:#1f2937;'>{q['question']}</span>", unsafe_allow_html=True)
+        st.markdown(f"<p style='margin:0.3rem 0 0 0;color:#065f46;font-size:0.9rem;'>✅ 答案：{', '.join(correct_opts)}</p>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
-        st.divider()
 
 # ===================== 答题主界面 =====================
-TYPE_LABEL = {"single": "🔘 单选题", "multi": "☑️ 多选题", "judge": "⚖️ 判断题"}
-
 def render_quiz():
     uid = st.session_state.user_uid
 
     if not st.session_state.quiz_started:
-        st.info("请在左侧选择模式，点击「开始/重置练习」按钮开始。")
+        st.markdown("<div style='text-align:center;padding:3rem 1rem;color:#2e7d32;font-size:1.05rem;'>👈 在左侧选择模式后，点击「开始/重置练习」</div>", unsafe_allow_html=True)
         return
 
     if st.session_state.quiz_finished:
         st.balloons()
         st.success("🎉 本轮练习完成！")
         if st.button("再来一轮", type="primary"):
-            st.session_state.current_batch = []
-            st.session_state.current_idx = 0
-            st.session_state.this_batch_answers = {}
+            st.session_state.batch_answers = {}
             st.session_state.quiz_finished = False
             st.session_state.quiz_started = True
             make_batch(MODE_MAP[st.session_state.selected_mode_label])
@@ -382,7 +369,7 @@ def render_quiz():
     q = batch[idx]
     qid = q["id"]
     qtype = q["type"]
-    done = qid in st.session_state.this_batch_answers
+    done = qid in st.session_state.batch_answers
 
     c1, c2 = st.columns([3, 1])
     c1.subheader(f"第 {idx+1}/{len(batch)} 题")
@@ -410,15 +397,14 @@ def render_quiz():
                     if not sel:
                         st.warning("⚠️ 请至少选择一个选项")
                         return
-                    st.session_state.this_batch_answers[qid] = sel
+                    st.session_state.batch_answers[qid] = sel
                 else:
                     if sel is None:
                         st.warning("⚠️ 请选择一个选项")
                         return
-                    st.session_state.this_batch_answers[qid] = sel
+                    st.session_state.batch_answers[qid] = sel
 
-                # 判题
-                ua = st.session_state.this_batch_answers[qid]
+                ua = st.session_state.batch_answers[qid]
                 cl = set(q["answer"].split("|"))
                 if qtype == "multi":
                     ul = {a.split(".")[0].strip().upper() for a in ua}
@@ -440,7 +426,7 @@ def render_quiz():
                 st.rerun()
     else:
         st.divider()
-        ua = st.session_state.this_batch_answers[qid]
+        ua = st.session_state.batch_answers[qid]
         cl = set(q["answer"].split("|"))
 
         if qtype == "multi":
@@ -458,16 +444,16 @@ def render_quiz():
         st.markdown("<h4 style='margin-top:0.75rem;'>📋 所有选项：</h4>", unsafe_allow_html=True)
         for opt in shuffled:
             letter = opt.split(".")[0].strip().upper()
-            ic = letter in cl
-            is_ = opt in ua if qtype == "multi" else opt == ua
-            fb = "✅ " if ic else ("❌ " if is_ and not ic else "")
-            bg = "background:#d1fae5;" if ic else "background:#fff;"
-            bd = "border:2px solid #10b981;" if ic else "border:2px solid #e5e7eb;"
-            co = "color:#065f46;" if ic else "color:#1f2937;"
-            st.markdown(f"<div style='{bg}{bd}{co}padding:0.5rem;margin-bottom:0.3rem;border-radius:0.375rem;font-size:1rem;'>{fb}{opt}</div>", unsafe_allow_html=True)
+            i_c = letter in cl
+            i_s = opt in ua if qtype == "multi" else opt == ua
+            fb = "✅ " if i_c else ("❌ " if i_s and not i_c else "")
+            bg = "background:#d1fae5;" if i_c else "background:#fff;"
+            bd = "border:2px solid #10b981;" if i_c else "border:2px solid #e5e7eb;"
+            color = "color:#065f46;" if i_c else "color:#1f2937;"
+            st.markdown(f"<div style='{bg}{bd}{color}padding:0.5rem;margin-bottom:0.3rem;border-radius:0.375rem;font-size:1rem;'>{fb}{opt}</div>", unsafe_allow_html=True)
 
-        co = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
-        st.markdown(f"<div style='margin-top:0.75rem;padding:0.75rem;background:#f9fafb;border-radius:0.5rem;'><h4 style='margin:0 0 0.3rem;color:#374151;'>💡 正确答案：</h4><p style='font-size:1rem;color:#065f46;margin:0;padding:0.5rem;background:#d1fae5;border-radius:0.375rem;border-left:4px solid #10b981;'><strong>{', '.join(co)}</strong></p></div>", unsafe_allow_html=True)
+        corr = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
+        st.markdown(f"<div style='margin-top:0.75rem;padding:0.75rem;background:#f9fafb;border-radius:0.5rem;'><h4 style='margin:0 0 0.3rem;color:#374151;'>💡 正确答案：</h4><p style='font-size:1rem;color:#065f46;margin:0;padding:0.5rem;background:#d1fae5;border-radius:0.375rem;border-left:4px solid #10b981;'><strong>{', '.join(corr)}</strong></p></div>", unsafe_allow_html=True)
 
         if st.button("➡️ 下一题", type="primary", use_container_width=True):
             st.session_state.current_idx += 1
@@ -485,14 +471,11 @@ def main():
 
     if "all_questions" not in st.session_state:
         st.session_state.all_questions = load_questions(BANK_PATH)
-
     if "selected_mode_label" not in st.session_state:
         st.session_state.selected_mode_label = "全部题目"
     if "correct_ids" not in st.session_state:
         st.session_state.correct_ids = set()
-    if "incorrect_ids" not in st.session_state:
         st.session_state.incorrect_ids = set()
-    if "error_counts" not in st.session_state:
         st.session_state.error_counts = {}
     if "quiz_started" not in st.session_state:
         st.session_state.quiz_started = False
