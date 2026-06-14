@@ -78,23 +78,50 @@ def firebase_call(endpoint, email, password):
 def _get_sa():
     sa = _load_secret("service_account")
     if sa is None:
+        st.session_state.fs_status = "⚠️ secrets 中无 service_account"
         return None
-    # SA 可能是 dict（TOML 原生）或 JSON 字符串
-    if isinstance(sa, dict) and "private_key" in sa:
-        # TOML """ 不转义 \n，需手动修复私钥中的字面 \n → 真换行
-        pk = sa.get("private_key", "")
-        if "\\n" in pk and "\n" not in pk.strip("-----"):
-            sa = dict(sa)
-            sa["private_key"] = pk.replace("\\n", "\n")
-        return sa
+
+    # 记录原始类型到 sidebar 方便调试
+    raw_type = type(sa).__name__
+
+    # 如果是字符串，尝试解析 JSON
     if isinstance(sa, str):
         try:
             sa = json.loads(sa)
         except json.JSONDecodeError:
+            # TOML """ 把 \n 变成真换行 → 破坏了 JSON → 尝试修复
             import re
-            fixed = re.sub(r'("private_key":\s*")(.*?)(")', lambda m: m.group(1)+m.group(2).replace('\n','\\n')+m.group(3), sa, flags=re.DOTALL)
-            sa = json.loads(fixed)
-    return sa if isinstance(sa, dict) and "private_key" in sa else None
+            fixed = re.sub(
+                r'("private_key":\s*")(.*?)(")',
+                lambda m: m.group(1) + m.group(2).replace('\n', '\\n') + m.group(3),
+                sa, flags=re.DOTALL
+            )
+            try:
+                sa = json.loads(fixed)
+            except json.JSONDecodeError:
+                st.session_state.fs_status = f"⚠️ SA JSON 解析失败（类型={raw_type}）"
+                return None
+
+    # 现在 sa 必须是 dict
+    if not isinstance(sa, dict) or "private_key" not in sa:
+        st.session_state.fs_status = f"⚠️ SA 格式异常（类型={raw_type}）"
+        return None
+
+    # 修复私钥中的 \n 字面量 → 真换行
+    pk = sa["private_key"]
+    # 检测：如果私钥里有 \n 字面量（两个字符反斜杠+n）但没有真换行，则替换
+    if "\\n" in pk and "\n" not in pk.replace("-----", ""):
+        sa = dict(sa)
+        sa["private_key"] = pk.replace("\\n", "\n")
+
+    # 最终验证 + 调试
+    pk = sa["private_key"]
+    debug_pk = pk[:80].replace("\n","↵")
+    if "-----BEGIN PRIVATE KEY-----" not in pk:
+        st.session_state.fs_status = f"⚠️ 私钥异常: {debug_pk}"
+        return None
+
+    return sa
 
 def _get_access_token():
     global _access_token, _token_expiry
@@ -121,7 +148,7 @@ def _get_access_token():
         _access_token = resp.get("access_token")
         _token_expiry = now + 3600
         if not _access_token:
-            st.session_state.fs_status = f"⚠️ Token 交换失败: {resp.get('error','未知')}"
+            st.session_state.fs_status = f"⚠️ Token 交换失败: {resp.get('error','未知')} ({resp.get('error_description','')[:30]})"
             return None
         return _access_token
     except Exception as e:
