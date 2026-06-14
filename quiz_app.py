@@ -123,8 +123,7 @@ def _get_access_token():
 def _fs_req(method, uid, data=None):
     token = _get_access_token()
     if not token:
-        st.session_state.fs_status = "⚠️ 无法连接云端（Token 获取失败）"
-        return None
+        return None  # _get_access_token 已经设了 fs_status
     url = f"{FIRESTORE_BASE}/users/{uid}"
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -140,10 +139,8 @@ def _fs_req(method, uid, data=None):
         requests.delete(url, headers=headers, timeout=10)
         return None
 
-    # PATCH / POST: 先用 POST 创建（upsert），不存在则创建，存在则覆盖
     if method == "PATCH":
         body = {"fields": _to_firestore(data)}
-        # 用 POST + documentId 做 upsert（最稳方式）
         r = requests.post(f"{FIRESTORE_BASE}/users?documentId={uid}", json=body, headers=headers, timeout=10)
         if r.status_code == 200:
             st.session_state.fs_status = "☁️ 已保存"
