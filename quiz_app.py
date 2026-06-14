@@ -99,8 +99,12 @@ def load_data(uid):
         st.session_state.correct_ids = set(data.get("correct_ids", []))
         st.session_state.incorrect_ids = set(data.get("incorrect_ids", []))
         st.session_state.error_counts = data.get("error_counts", {})
+        st.session_state.selected_mode_label = data.get("selected_mode_label", "全部题目")
     else:
-        _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "created_at": int(time.time())})
+        _doc(uid).set({"email": st.session_state.user_email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "selected_mode_label": "全部题目", "created_at": int(time.time())})
+        st.session_state.selected_mode_label = "全部题目"
+    st.session_state.quiz_started = False
+    st.session_state.data_loaded = True
 
 def save_data(uid):
     if db is None:
@@ -109,6 +113,7 @@ def save_data(uid):
         "correct_ids": list(st.session_state.correct_ids),
         "incorrect_ids": list(st.session_state.incorrect_ids),
         "error_counts": st.session_state.error_counts,
+        "selected_mode_label": st.session_state.selected_mode_label,
         "updated_at": int(time.time()),
     }, merge=True)
 
@@ -224,6 +229,7 @@ def render_login():
                 st.session_state.user_email = email
                 st.session_state.user_uid = uid
                 st.session_state.logged_in = True
+                st.session_state.data_loaded = True
                 if db:
                     _doc(uid).set({"email": email, "correct_ids": [], "incorrect_ids": [], "error_counts": {}, "created_at": int(time.time())})
                 st.rerun()
@@ -249,7 +255,7 @@ def render_sidebar():
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.user_email}**")
         if st.button("🚪 退出登录"):
-            for k in ["logged_in", "user_email", "user_uid"]:
+            for k in ["logged_in", "user_email", "user_uid", "data_loaded"]:
                 st.session_state.pop(k, None)
             st.rerun()
 
@@ -291,21 +297,9 @@ def render_sidebar():
             c2.metric("🎯 正确率", f"{acc:.1f}%")
 
         st.divider()
-        st.header("📝 错题库")
-        wr = [q for q in st.session_state.all_questions
-              if q["id"] in st.session_state.error_counts and st.session_state.error_counts[q["id"]] >= 2]
-        st.metric("需重点复习", len(wr))
-        with st.expander("点击展开错题库", expanded=False):
-            if not wr:
-                st.info("暂无需要重点复习的错题。")
-            else:
-                for q in wr:
-                    ec = st.session_state.error_counts[q["id"]]
-                    with st.expander(f"ID: {q['id']} (错 {ec} 次)"):
-                        st.write(f"**题干:** {q['question']}")
-                        cl = q["answer"].split("|")
-                        co = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
-                        st.markdown(f"**正确答案:** <span style='color:green'>{', '.join(co)}</span>", unsafe_allow_html=True)
+        if st.button("📝 查看错题", type="primary", use_container_width=True):
+            st.session_state.show_wrong = True
+            st.rerun()
 
         st.divider()
         with st.expander("⚠️ 高级选项", expanded=False):
@@ -316,6 +310,40 @@ def render_sidebar():
                 st.session_state.error_counts = {}
                 st.success("✅ 已清空！")
                 st.rerun()
+
+# ===================== 错题查看界面 =====================
+def render_wrong_questions():
+    st.subheader("📝 错题回顾")
+
+    wr = [q for q in st.session_state.all_questions
+          if q["id"] in st.session_state.error_counts and st.session_state.error_counts[q["id"]] >= 1]
+
+    if st.button("🔙 返回刷题", type="primary"):
+        st.session_state.show_wrong = False
+        st.rerun()
+
+    if not wr:
+        st.info("🎉 暂无错题，继续保持！")
+        return
+
+    st.markdown(f"共 **{len(wr)}** 道错题")
+
+    for q in wr:
+        ec = st.session_state.error_counts[q["id"]]
+        qtype = q["type"]
+        type_label = TYPE_LABEL.get(qtype, "题目")
+
+        cl = q["answer"].split("|")
+        co = [o for o in q["options"] if any(o.startswith(c) for c in cl)]
+
+        st.markdown(f"<div style='background:#f8fafc;padding:1rem;border-radius:0.5rem;margin:0.75rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.1);'>", unsafe_allow_html=True)
+        st.markdown(f"<span style='color:#dc2626;font-weight:700;'>错 {ec} 次</span> &nbsp; {type_label} &nbsp; <span style='font-size:1rem;font-weight:600;'>{q['question']}</span>", unsafe_allow_html=True)
+        for opt in q["options"]:
+            letter = opt.split(".")[0].strip().upper()
+            if letter in cl:
+                st.markdown(f"<div style='background:#d1fae5;border:2px solid #10b981;color:#065f46;padding:0.4rem 0.75rem;margin:0.2rem 0;border-radius:0.375rem;'>✅ {opt}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.divider()
 
 # ===================== 答题主界面 =====================
 TYPE_LABEL = {"single": "🔘 单选题", "multi": "☑️ 多选题", "judge": "⚖️ 判断题"}
@@ -455,6 +483,7 @@ def main():
 
     if "selected_mode_label" not in st.session_state:
         st.session_state.selected_mode_label = "全部题目"
+    if not st.session_state.get("data_loaded"):
         st.session_state.quiz_started = False
         st.session_state.error_counts = {}
         st.session_state.correct_ids = set()
@@ -463,7 +492,10 @@ def main():
     st.title("🔧 结构修理 刷题助手")
     st.divider()
     render_sidebar()
-    render_quiz()
+    if st.session_state.get("show_wrong"):
+        render_wrong_questions()
+    else:
+        render_quiz()
 
 if __name__ == "__main__":
     main()
