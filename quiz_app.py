@@ -114,28 +114,33 @@ def _get_access_token():
 def _fs_req(method, uid, data=None):
     token = _get_access_token()
     if not token:
+        st.session_state.fs_status = "⚠️ 无法连接云端（Token 获取失败）"
         return None
     url = f"{FIRESTORE_BASE}/users/{uid}"
     headers = {"Authorization": f"Bearer {token}"}
 
     if method == "GET":
         r = requests.get(url, headers=headers, timeout=10)
-        return r.json() if r.status_code == 200 else None
+        if r.status_code == 200:
+            st.session_state.fs_status = "☁️ 已连接"
+            return r.json()
+        st.session_state.fs_status = f"⚠️ 读取失败 ({r.status_code})"
+        return None
 
     if method == "DELETE":
-        r = requests.delete(url, headers=headers, timeout=10)
-        return None  # 不关心返回值
+        requests.delete(url, headers=headers, timeout=10)
+        return None
 
-    # PATCH: 先尝试更新，不存在则创建
+    # PATCH / POST: 先用 POST 创建（upsert），不存在则创建，存在则覆盖
     if method == "PATCH":
         body = {"fields": _to_firestore(data)}
-        r = requests.patch(url, json=body, headers=headers, timeout=10)
-        if r.status_code in (200, 204):
+        # 用 POST + documentId 做 upsert（最稳方式）
+        r = requests.post(f"{FIRESTORE_BASE}/users?documentId={uid}", json=body, headers=headers, timeout=10)
+        if r.status_code == 200:
+            st.session_state.fs_status = "☁️ 已保存"
             return r.json()
-        # 文档不存在 → 创建
-        create_url = f"{FIRESTORE_BASE}/users?documentId={uid}"
-        r2 = requests.post(create_url, json=body, headers=headers, timeout=10)
-        return r2.json() if r2.status_code == 200 else None
+        st.session_state.fs_status = f"⚠️ 保存失败 ({r.status_code})"
+        return None
 
     return None
 
@@ -312,6 +317,7 @@ def render_sidebar():
     total = len(st.session_state.all_questions)
     with st.sidebar:
         st.markdown(f"👤 **{st.session_state.user_email}**")
+        st.caption(st.session_state.get("fs_status", ""))
 
         if st.button("🚪 退出登录"):
             for k in ["logged_in", "user_email", "user_uid"]:
@@ -533,6 +539,8 @@ def main():
         st.session_state.error_counts = {}
     if "quiz_started" not in st.session_state:
         st.session_state.quiz_started = False
+    if "fs_status" not in st.session_state:
+        st.session_state.fs_status = "☁️ 等待连接..."
 
     st.title("🔧 结构修理 刷题助手")
     st.divider()
