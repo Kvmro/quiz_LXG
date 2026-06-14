@@ -97,7 +97,11 @@ def _get_access_token():
     if sa is None:
         return None
 
-    import jwt
+    try:
+        import jwt
+    except ImportError:
+        return None
+
     now = int(time.time())
     payload = {"iss":sa["client_email"],"scope":"https://www.googleapis.com/auth/datastore","aud":sa["token_uri"],"exp":now+3600,"iat":now}
     signed = jwt.encode(payload, sa["private_key"], algorithm="RS256")
@@ -113,15 +117,27 @@ def _fs_req(method, uid, data=None):
         return None
     url = f"{FIRESTORE_BASE}/users/{uid}"
     headers = {"Authorization": f"Bearer {token}"}
+
     if method == "GET":
         r = requests.get(url, headers=headers, timeout=10)
-    elif method == "PATCH":
-        r = requests.patch(url, json={"fields": _to_firestore(data)}, headers=headers, timeout=10)
-    elif method == "DELETE":
+        return r.json() if r.status_code == 200 else None
+
+    if method == "DELETE":
         r = requests.delete(url, headers=headers, timeout=10)
-    else:
-        return None
-    return r.json() if r.status_code in (200, 204) else None
+        return None  # 不关心返回值
+
+    # PATCH: 先尝试更新，不存在则创建
+    if method == "PATCH":
+        body = {"fields": _to_firestore(data)}
+        r = requests.patch(url, json=body, headers=headers, timeout=10)
+        if r.status_code in (200, 204):
+            return r.json()
+        # 文档不存在 → 创建
+        create_url = f"{FIRESTORE_BASE}/users?documentId={uid}"
+        r2 = requests.post(create_url, json=body, headers=headers, timeout=10)
+        return r2.json() if r2.status_code == 200 else None
+
+    return None
 
 def _to_firestore(data):
     fd = {}
@@ -271,6 +287,10 @@ def render_login():
                 st.session_state.user_email = email
                 st.session_state.user_uid = uid
                 st.session_state.logged_in = True
+                st.session_state.correct_ids = set()
+                st.session_state.incorrect_ids = set()
+                st.session_state.error_counts = {}
+                st.session_state.selected_mode_label = "全部题目"
                 _fs_req("PATCH", uid, {"email": email, "created_at": int(time.time())})
                 st.rerun()
             else:
