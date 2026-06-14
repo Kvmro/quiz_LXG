@@ -274,6 +274,7 @@ def render_sidebar():
         st.markdown(f"<div style='color:#2e7d32;font-size:0.85rem;font-weight:600;'>📚 题库共 {total} 题</div><div style='color:#6b7280;font-size:0.78rem;margin-bottom:0.5rem;'>单选 {sn} · 多选 {mn} · 判断 {jn}</div>", unsafe_allow_html=True)
 
         if st.button("🚀 开始/重置练习", type="primary"):
+            st.session_state.show_wrong = False
             st.session_state.batch_answers = {}
             st.session_state.quiz_finished = False
             st.session_state.quiz_started = True
