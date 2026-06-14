@@ -68,13 +68,31 @@ def init_firestore():
         sa = _load_secret("service_account")
         if sa is None:
             return
+
+        # SA 可能是：dict / JSON 字符串 / TOML 被破坏的字符串
         if isinstance(sa, str):
-            sa = json.loads(sa)
+            try:
+                sa = json.loads(sa)
+            except json.JSONDecodeError:
+                # TOML 的 """ 把 \n 转成真换行符 → 破坏了 JSON
+                # 尝试修复：把真换行替换回 \n
+                import re
+                fixed = re.sub(
+                    r'("private_key":\s*")(.*?)(")',
+                    lambda m: m.group(1) + m.group(2).replace('\n', '\\n') + m.group(3),
+                    sa, flags=re.DOTALL
+                )
+                sa = json.loads(fixed)
+
+        if not isinstance(sa, dict):
+            st.sidebar.caption("⚠️ service_account 格式错误")
+            return
+
         if not firebase_admin._apps:
             firebase_admin.initialize_app(credentials.Certificate(sa))
         db = firestore.client()
-    except Exception:
-        pass
+    except Exception as e:
+        st.sidebar.caption(f"⚠️ 初始化失败: {str(e)[:50]}")
 
 def firebase_call(endpoint, email, password):
     key = _load_secret("api_key")
