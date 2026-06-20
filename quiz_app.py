@@ -43,20 +43,48 @@ def _auth_post(endpoint, data):
         f"https://identitytoolkit.googleapis.com/v1/accounts:{endpoint}?key={API_KEY}",
         json={**data, "returnSecureToken": True}, timeout=10).json()
 
+# ==================== Token 刷新 ====================
+def _refresh_token():
+    """idToken 过期时，用 refreshToken 换取新 token"""
+    rt = st.session_state.get("_refresh_token")
+    if not rt: return False
+    try:
+        r = requests.post(
+            f"https://securetoken.googleapis.com/v1/token?key={API_KEY}",
+            data={"grant_type": "refresh_token", "refresh_token": rt},
+            timeout=10
+        ).json()
+        if "id_token" in r:
+            st.session_state._id_token = r["id_token"]
+            st.session_state._refresh_token = r.get("refresh_token", rt)
+            return True
+    except: pass
+    return False
+
 # ==================== RTDB ====================
 def _rtdb_call(method, uid, data=None):
     token = st.session_state.get("_id_token")
     if not token:
         return None
     url = f"{RTDB_URL}/users/{uid}.json?auth={token}"
-    if method == "GET":
-        r = requests.get(url, timeout=10)
-        return r.json() if r.status_code == 200 else None
-    if method == "PUT":
-        r = requests.put(url, json=data, timeout=10)
-        st.session_state.fs_status = "☁️ 已保存" if r.status_code == 200 else f"⚠️ 保存失败 {r.status_code}"
-    if method == "DELETE":
-        requests.delete(url, timeout=10)
+    try:
+        if method == "GET":
+            r = requests.get(url, timeout=10)
+            if r.status_code == 401 and _refresh_token():
+                r = requests.get(f"{RTDB_URL}/users/{uid}.json?auth={st.session_state._id_token}", timeout=10)
+            return r.json() if r.status_code == 200 else None
+        if method == "PUT":
+            r = requests.put(url, json=data, timeout=10)
+            if r.status_code == 401 and _refresh_token():
+                r = requests.put(f"{RTDB_URL}/users/{uid}.json?auth={st.session_state._id_token}", json=data, timeout=10)
+            st.session_state.fs_status = "☁️ 已保存" if r.status_code == 200 else f"⚠️ 保存失败 {r.status_code}"
+        if method == "DELETE":
+            r = requests.delete(url, timeout=10)
+            if r.status_code == 401 and _refresh_token():
+                requests.delete(f"{RTDB_URL}/users/{uid}.json?auth={st.session_state._id_token}", timeout=10)
+    except Exception as e:
+        st.session_state.fs_status = f"⚠️ 网络异常 {type(e).__name__}"
+        return None if method == "GET" else None
 
 def load_data(uid):
     data = _rtdb_call("GET", uid)
@@ -159,6 +187,7 @@ def render_login():
                 st.session_state.user_uid = r["localId"]
                 st.session_state.logged_in = True
                 st.session_state._id_token = r["idToken"]
+                st.session_state._refresh_token = r.get("refreshToken", "")
                 st.rerun()
             else:
                 r = _auth_post("signInWithPassword", {"email": email, "password": pw})
@@ -169,6 +198,7 @@ def render_login():
                 st.session_state.user_uid = r["localId"]
                 st.session_state.logged_in = True
                 st.session_state._id_token = r["idToken"]
+                st.session_state._refresh_token = r.get("refreshToken", "")
                 load_data(r["localId"])
                 st.rerun()
 
@@ -204,7 +234,7 @@ def render_sidebar():
         st.caption(st.session_state.get("fs_status", ""))
 
         if st.button("🚪 退出登录"):
-            for k in ["logged_in", "user_email", "user_uid", "_id_token"]: st.session_state.pop(k, None)
+            for k in ["logged_in", "user_email", "user_uid", "_id_token", "_refresh_token"]: st.session_state.pop(k, None)
             st.rerun()
 
         st.divider()
@@ -278,9 +308,14 @@ def render_wrong():
 # ==================== 答题 ====================
 def _judge_result(q, ua):
     cl = set(q["answer"].split("|"))
-    if q["type"] == "multi":
-        return {a.split(".")[0].strip().upper() for a in ua} == cl, cl
-    return (ua.split(".")[0].strip().upper() if ua else "") in cl, cl
+    try:
+        if q["type"] == "multi":
+            if not isinstance(ua, list): return False, cl
+            return {a.split(".")[0].strip().upper() for a in ua} == cl, cl
+        if not isinstance(ua, str): return False, cl
+        return (ua.split(".")[0].strip().upper() if ua else "") in cl, cl
+    except Exception:
+        return False, cl
 
 def render_quiz():
     uid = st.session_state.user_uid
@@ -347,7 +382,10 @@ def render_quiz():
                     st.session_state.correct_ids.discard(qid)
                     st.session_state.error_counts[qid] = st.session_state.error_counts.get(qid, 0) + 1
                 st.session_state.total_answers = st.session_state.get("total_answers", 0) + 1
-                save_data(uid)
+                try:
+                    save_data(uid)
+                except Exception:
+                    pass  # 保存失败不影响答题流程
                 st.rerun()
     else:
         st.divider()
